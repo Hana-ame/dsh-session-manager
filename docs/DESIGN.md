@@ -94,7 +94,7 @@
 
 | 类别 | 工具 | 写 ① 吗 |
 |---|---|---|
-| 观察 | `session_list`、`session_read`、`session_queue`、`session_delegations` | `session_list` 会（观测血缘）；`session_delegations` 会（结案委托，见 D8）；另两个不会 |
+| 观察 | `session_list`、`session_read`、`session_queue`、`session_delegations` | `session_list` 会（观测血缘）；`session_delegations` 会（结案委托或 dismiss 删记录时，见 D8）；另两个不会 |
 | 驱动 | `session_send`、`session_stop`、`session_compact`、`session_fork`、`session_create` | `session_send(callback)` 会记账、`session_create` 会记下新会话；其余只写目标会话日志 |
 | 记录 | `session_describe` | 会 |
 | 模型 | `session_models`、`session_model` | 不会 |
@@ -112,7 +112,7 @@
 
 ```
 GET|HEAD /session-manager/state
-200 {"version":2,"file":"<绝对路径>","byId":{…}}
+200 {"version":3,"file":"<绝对路径>","byId":{…}}
 500 {"version":0,"byId":{},"error":"…"}      # 读盘失败
 405 "session-manager: method not allowed"    # 其它方法
 ```

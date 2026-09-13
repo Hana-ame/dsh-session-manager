@@ -19,7 +19,7 @@ package/                             # @local/dsh-session-manager：唯一的包
 ├── package.json                     # exports: "." | "./client" | "./tools" | "./store"
 ├── lib/
 │   ├── store.mjs                    # ① 持久化存储（原子写 + stat 校验缓存）
-│   ├── tools.mjs                    # ② 11 个管理工具（preset 挂载这一层）
+│   ├── tools.mjs                    # ② 12 个管理工具（preset 挂载这一层）
 │   ├── index.js                     # host 半：提供 GET /session-manager/state，把 ① 送给 ③
 │   └── client.js                    # ③ 画布（手写 classic-script bundle）
 ├── test/
@@ -56,11 +56,11 @@ install.sh                           # 一次装好：package + preset + profile
 
 | 工具 | 作用 |
 |---|---|
-| `session_list` | 列出**其他**会话（自己永远排除）：id、工作目录、标题、运行状态、血统（顶层 / 分叉 / 子会话）、私有备注、当前模型路由。默认只看当前工作目录，`scope:"all"` 看全进程。**每次列出的血统都会写进 ①**，所以关系不会因为它描述的会话被归档而消失 |
-| `session_read` | **只读**读某个会话最近的事件。`detail:"text"`（默认）只给 user/assistant 对话文本；`detail:"tools"` 再加工具调用、工具结果与失败信息；`detail:"all"` 再加 system/上下文消息、思考文本与标题变更。不唤醒、不写入，冷会话也能读 |
+| `session_list` | 列出**其他**会话（自己永远排除）：id、工作目录、标题、运行状态、血统（顶层 / 分叉 / 子会话）、私有备注、当前模型路由。默认只看当前工作目录（可显式传 `cwd`），`scope:"all"` 看全进程；支持 `runningOnly` 仅看运行中会话，`limit` 限制条数（默认 40）。**每次列出的血统都会写进 ①**，所以关系不会因为它描述的会话被归档而消失 |
+| `session_read` | **只读**读某个会话最近的事件。`detail:"text"`（默认）只给 user/assistant 对话文本；`detail:"tools"` 再加工具调用、工具结果与失败信息；`detail:"all"` 再加 system/上下文消息、思考文本与标题变更。支持 `limit`（默认 8）与 `maxChars`（默认 1200）。不唤醒、不写入，冷会话也能读 |
 | `session_send` | 投递一条提示并唤醒目标：`queue`（默认，等它当前轮次结束）/ `steer`（在最近的 step 边界插入）。**`callback:true` = 委托带回音**：目标跑完那一轮后，结果自动投回你的会话 |
-| `session_queue` | **只读**列出某个会话当前排队中的消息：顺序即投递顺序，每条带 `queued` / `steering` 标注。队列属于活着的 agent，冷会话没有队列；不投递、不取消、不放行。对这个会话有委托时，末尾附委托计数 |
-| `session_delegations` | **只读**委托账本（持久化）：每条带 `callback` 的委托的状态、任务摘要与对方的答复；`pending` / `done` / `failed` / `unknown`，可用 `dismiss` 删掉已结案的行 |
+| `session_queue` | **只读**列出某个会话当前排队中的消息：顺序即投递顺序，每条带 `queued` / `steering` 标注，支持 `maxChars`（默认 400）。队列属于活着的 agent，冷会话没有队列；不投递、不取消、不放行。对这个会话有委托时，末尾附委托计数 |
+| `session_delegations` | **只读**委托账本（持久化）：每条带 `callback` 的委托的状态、任务摘要与对方的答复；可按目标 `sessionId`、状态（`pending` / `done` / `failed` / `unknown`）过滤或设置 `limit`（默认 20），可用 `dismiss` 删掉已结案的行 |
 | `session_stop` | 取消某活跃会话的当前轮次，保留其已排队消息 |
 | `session_compact` | 要求某**活着且空闲**的会话立刻压缩自己的历史：在它自己的作用域里跑它的 `/compact`，可压缩段被替换成一个摘要节点 |
 | `session_fork` | 在某个**已完成轮次**的边界上把会话分叉成独立副本，返回新的 session id |
@@ -123,7 +123,7 @@ install.sh                           # 一次装好：package + preset + profile
 - `tools`：再加 `tool/call`（工具名 + 参数，参数截断到 400 字符）与 `tool/result`（结果文本，失败时带 `error.name: error.code`）；
 - `all`：再加 `system/message`（插件注入的上下文）、assistant 的 `reasoning` 文本、`session/title` 变更。
 
-读取**不会唤醒**目标会话（`inspect` 不 resolve Agent），也**不写任何东西**。
+读取**不会唤醒**目标会话（`inspect` 不 resolve Agent），也**不写任何东西**。默认返回最近 8 条匹配事件（`limit` 范围 1-40），单条事件默认上限 1200 字符（`maxChars` 范围 200-4000），总返回字符设有 12000 字符保护上限。
 
 ## 排队消息（`session_queue`）
 
@@ -133,7 +133,7 @@ install.sh                           # 一次装好：package + preset + profile
 2. 取走目标会话那一项（`placement` 是 `queued` / `steering` / `context`）；
 3. **先 `abort()` 再 `break`** —— 直接 break 会等这个流自己取消，而那个取消信号正是我们手里的这一个，会死锁。
 
-冷会话没有 inbox，工具会明确说明而不是假装「队列为空」。
+冷会话没有 inbox，工具会明确说明而不是假装「队列为空」。单条文本默认截断至 400 字符（可通过 `maxChars` 指定，范围 100-2000）。若有针对该会话的委托记录，末尾会附带委托统计。
 
 ## 委托回调（`session_send({callback:true})` + `session_delegations`）
 
@@ -151,7 +151,7 @@ install.sh                           # 一次装好：package + preset + profile
 
 - **`baselineSeq` 之前的 `turn/end` 会被忽略**。`mode:"queue"` 时目标可能正在跑上一轮，那一轮结束跟你的委托无关；要等你的提示被接纳（日志里出现那条用户消息）之后，才是"你的那一轮"。
 - **读的是持久日志，不是内存句柄**：进程重启后仍处于 `pending` 的委托会被继续盯到（preset 挂载时轮询器就起来了），不需要重新发起。
-- **两条腿**：轮询（5 秒一次，且只有存在 `pending` 时才真正读盘）负责**推送**——结果自己回到你的会话；`session_delegations` 负责**对账**，它读之前先强制跑一遍检查，所以即使通知没送到（例如委托方会话已被删），账本里也已经写好结果。
+- **两条腿**：轮询（5 秒一次，且只有存在 `pending` 时才真正读盘）负责**推送**——结果自己回到你的会话；`session_delegations` 负责**对账**，它读之前先强制跑一遍检查，所以即使通知没送到（例如委托方会话已被删），账本里也已经写好结果。支持按目标 `sessionId`、`status`（`pending` / `done` / `failed` / `unknown`）过滤，支持 `limit` 控制条数（默认 20），并可传入 `dismiss` 移除指定委托记录。
 - **状态**：`pending`（还没跑完）/ `done`（`completed` 或 `max-tokens`）/ `failed`（`aborted` / `blocked` / 报错等，`note` 里带原因）/ `unknown`（没有确认到）。
 - **不会重复通知**：委托一旦结案就不再重新判定（只有 `pending` 的记录才能被结案），所以不会因为下一轮又结束而再投一次。
 - 回调通知本身是普通的 `queue` 消息，**不会打断**委托方正在跑的轮次；它会看到一条以 `[委托回调]` 开头的用户消息。
@@ -174,7 +174,7 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 
 `session_describe({ sessionId, description? })`：
 
-- 给 `description` → 设置备注（trim 后截断到 200 字符）；给空串 → 清除；整个字段省略 → 读当前备注。
+- 给 `description` → 设置备注（trim 后截断到 200 字符）；给空串 → 清除；整个字段省略 → 读当前备注。若目标 `sessionId` 当前在进程中未找到，备注仍会被持久化存储，并附带 Warning 提示。
 - 它**不是会话标题**：不写进任何会话日志，所以侧栏、会话列表、轨迹视图、其他 agent 都看不到。只有本包的 `session_list` 会显示 `note:`，画布（读同一份 ①）会画在节点里与详情里。
 - 清除备注**不会**清掉这个会话的血统记录——两者在同一条记录里但互不覆盖。
 - **它不是保密边界**：文件就在 DSH home 里，任何进程都能打开。它是**归属边界**——除了这个包，没有别的东西读写它。
@@ -214,7 +214,7 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 - **切点**：只在已完成轮次（`turn/end`）的边界上切。默认取最后一个；给了 `atSeq` 就取第一个 `seq >= atSeq` 的 `turn/end`，再把切点向后推到下一个 `turn/start`。
 - **继承**：源会话的 agent preset 与工作目录（并挂到源会话所在 workspace）。
 - **独立**：副本有自己的日志和 agent，`session_read` / `session_send` / `session_stop` 对它全部有效。
-- **标题**：不给 `title` 时自动改名为 `"<源标题> · fork"`。
+- **标题**：可显式指定 `title`（截断至 60 字符）；不给 `title` 时自动改名为 `"<源标题> · fork"`（源会话无标题时为 `"fork"`）。
 - **注意**：切点之后源会话产生的内容**不在副本里**；副本站起来用的是**当前默认模型**。
 
 ## 使用画布（③）

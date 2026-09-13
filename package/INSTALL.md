@@ -33,7 +33,7 @@ around by moving files:
 | Layer | File | Mounted by | Reads/writes |
 | --- | --- | --- | --- |
 | ① persistence | `lib/store.mjs` | imported by ② and the host half | `<DSH_HOME>/session-manager/state.json` |
-| ② tools | `lib/tools.mjs` | the preset row (`tool-session-control`) | the store, `sessionController`, `agents` |
+| ② tools | `lib/tools.mjs` | the preset row (`tool-session-control`) | the store, `sessionController`, `agents`, `commands`, `workspaceRegistry` |
 | ③ canvas | `lib/client.js` | the profile row's client half | `remote.session.list` + the store route |
 
 The host half `lib/index.js` exists so that ① reaches the page: a durable client

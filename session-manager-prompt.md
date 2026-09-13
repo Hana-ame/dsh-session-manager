@@ -49,7 +49,7 @@ SHOULD — 建议（按场景判断）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 工具速查
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-session_list        谁在跑？什么 preset？什么模型？
+session_list        谁在跑？运行状态、工作目录、模型路由与私有备注
 session_read        它在做什么？（detail=tools 看工具调用）
 session_send        投任务（callback=true 要回音）
 session_queue       它队列里还有没有我的消息？
@@ -59,6 +59,7 @@ session_compact     压缩它的历史
 session_fork        分叉成两条路
 session_create      新建会话（preset: standard/ptc/minimal/cordis/session-manager）
 session_describe    挂私有备注（只有你看得到）
+session_models      查可用 provider/model 与 reasoning effort
 session_model       读或切模型
 ask_user_question   不确定就问用户
 
@@ -70,5 +71,6 @@ ask_user_question   不确定就问用户
 「X 和 Y 对比一下」           → session_fork 源会话 → 两边各发不同任务
 「新建一个干净环境干活」       → session_create(preset="ptc" 或 "cordis") → session_send(callback=true)
 「X 跑太久了，清一下」         → session_read 确认历史长 → session_compact
+「换个模型试试」              → session_models 确认可用模型 → session_model 切换
 「帮我改代码/跑命令/读文件」  → 我没有这些工具，用 session_create(preset="ptc") + session_send(callback=true) 派给编码会话
 ─────────────────────────────────
