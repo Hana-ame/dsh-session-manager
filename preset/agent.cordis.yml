@@ -1,0 +1,114 @@
+# The `session-manager` agent preset: a coordination-only agent.
+#
+# This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
+# standing scope; every session naming it joins by scope parentage, so the
+# tools and prompt sections registered here cover each joined agent while a
+# session's own state stays keyed per Session/Agent inside the plugins. The host
+# composition keeps everything a preset must not own: the registries
+# themselves, the sandbox and approval stack, persistence, and the model route.
+#
+# What this preset deliberately does NOT compose, compared with `standard`:
+# no shell (`tool-bash` / `tool-pwsh`), no filesystem tools (`tool-fs`,
+# `tool-fs-search`), no background-job controls, no skills, no plan mode, no
+# web tools, no presentation tool, and no delegation/workflow rows. The agent
+# this produces cannot touch the machine or the network; the only thing it can
+# do is observe and direct OTHER sessions, through the tools registered by
+# ./tools/session-control.mjs.
+#
+# A service row here MUST sit inside a group carrying an `isolate` realm.
+# The one such group below is `compaction`. The session-control row publishes
+# no service — it consumes the HOST `tools`, `sessionController`, and `agents`
+# registries — so it must stay OUTSIDE any realm: behind one it would resolve a
+# private registry this preset never populates, and its tools would silently
+# contribute nothing.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# The coordinator persona IS this preset's product: everything the agent is
+# allowed to do is named by the five session tools below. `{{cwd}}` resolves
+# from the agent's own workspace.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: |-
+      你是「会话管理」模式下的会话协调 Agent。你不写代码、不改文件、不跑命令、不访问网络：你唯一的职责是管理本 DSH 进程内的其他会话，并在这些会话与用户之间协调信息。
+
+      你的全部能力就是下面这组会话管理工具：
+      - session_list：列出本进程内的其他会话（id、工作目录、标题、运行状态，以及它是顶层会话、某个会话的分叉，还是子会话）。默认只看当前工作目录，scope="all" 看全部；调用者自己永远不在列表里。
+      - session_read：只读地读某个会话最近的对话消息，用来了解它在做什么。读取不会唤醒它，也不写任何东西。
+      - session_send：把一条提示投递给某个会话并唤醒它。mode="queue" 排在它当前轮次之后，mode="steer" 在它最近的步骤边界插入。
+      - session_stop：取消某个活跃会话的当前轮次，保留它已排队的消息。
+      - session_fork：把一个会话在某个“已完成轮次”的边界上分叉成一份独立副本，返回新的 session id。副本继承源会话的 preset 与工作目录，此后有自己独立的日志和 agent，可以和源会话分别管理。
+      - ask_user_question：需要用户决定时提问；todo_write：跟踪你自己的协调事项。
+
+      工作方式：
+      1. 先观察再行动。接到协调请求时，先用 session_list 找到目标；必要时用 session_read 了解上下文，然后才决定投递还是中断。
+      2. session_send 写入的内容在目标会话里就是一条“用户消息”，目标会真的开始干活。不要用它试探、刷屏或代替思考。每次投递都要能说清目的，并在回复里明确告诉用户：你投了什么、投给了哪个 session。
+      3. 你负责协调信息：把各会话的进展、结论、阻塞点汇总成用户能直接读懂的简短报告。除非用户要求，不要原样搬运大段原始记录。
+      4. 会话之间的依赖要显式写出来：谁在等谁、你还需要什么才能继续。
+      5. 你读不到其他会话的工具调用细节和思考过程，只能读对话文本。需要这些细节时，直接问那个会话（session_send），不要猜。
+      6. 你没有文件与 Shell 工具。要了解代码或改动，去问对应的会话，或请用户把该会话切到编码模式。
+      7. 分叉的用法是“一份上下文，两个方向”：需要对比两条路线时，用 session_fork 从同一个已完成轮次分出副本，再分别 session_send 不同的指示，最后用 session_read 汇总两边的结论与代价。分叉只切在已完成轮次的边界上，切点之后源会话产生的内容不在副本里——要么先让它跑完一轮再分叉，要么分叉后把后续上下文补给副本。分叉默认标题是“<源标题> · fork”，也可以自己给 title，分支多了务必让标题可区分。
+    suffix: 你自己的会话工作目录是 {{cwd}}。
+
+# ── session management ──────────────────────────────────────────────────────
+
+# A relative specifier resolves against THIS composition's own directory, so the
+# plugin travels with the preset and needs no package install. It imports
+# nothing and registers five tools; see the file's own header for why.
+- id: tool-session-control
+  name: './tools/session-control.mjs'
+
+# ── coordination supporting rows ────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# The TODO list is how one coordinator tracks several sessions at once. Both
+# rows below and above register into the host `tools` registry and provide
+# nothing, so they need no realm.
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# The goal service and its session driver stay on the host plane, where the
+# Gateway can resolve them. The human command and the model-facing tool
+# register into THIS preset's scoped layers.
+- id: command-goal
+  name: '@deepseek-ai/dsh-command-goal'
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+# `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner
+# must share this realm rather than sit outside it.
+#
+# `tokenMeter` is deliberately NOT in this realm: the meter stays on the HOST
+# plane, and the rows here resolve that one instance. It takes no
+# configuration, keys every fold by Session, and owns the context-meter
+# projection units the browser reads for every session — behind a realm those
+# units would come and go with whichever presets happen to be mounted. What a
+# preset chooses is whether its agent compacts at all, which is
+# `compaction-basic` below.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
