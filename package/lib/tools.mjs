@@ -269,24 +269,27 @@ export default {
       controller: ctx.get('sessionController'),
       agents: ctx.get('agents'),
       commands: ctx.get('commands'),
+      workspaces: ctx.get('workspaceRegistry'),
     });
 
-    /** The calling agent's durable id and workspace cwd, read defensively. */
+    /** The calling agent's durable id, workspace cwd and preset, read defensively. */
     const callerOf = (exec) => {
-      const found = { id: null, cwd: null };
+      const found = { id: null, cwd: null, preset: null };
       const agent = exec !== null && exec !== undefined && exec.agent !== undefined ? exec.agent : null;
       if (agent === null || agent === undefined) return found;
       if (typeof agent.id === 'string') found.id = agent.id;
       const session = agent.session;
-      if (session !== null && session !== undefined && session.header !== null && session.header !== undefined && typeof session.header.cwd === 'string') {
-        found.cwd = session.header.cwd;
+      if (session !== null && session !== undefined && session.header !== null && session.header !== undefined) {
+        if (typeof session.header.cwd === 'string') found.cwd = session.header.cwd;
+        if (typeof session.header.agentPreset === 'string' && session.header.agentPreset.length > 0) found.preset = session.header.agentPreset;
       }
       if (found.cwd === null && found.id !== null) {
         const { agents } = runtime();
         const live = agents !== undefined && agents !== null && typeof agents.get === 'function' ? agents.get(found.id) : undefined;
         const liveSession = live !== undefined && live !== null ? live.session : undefined;
-        if (liveSession !== undefined && liveSession !== null && liveSession.header !== undefined && liveSession.header !== null && typeof liveSession.header.cwd === 'string') {
-          found.cwd = liveSession.header.cwd;
+        if (liveSession !== undefined && liveSession !== null && liveSession.header !== undefined && liveSession.header !== null) {
+          if (typeof liveSession.header.cwd === 'string') found.cwd = liveSession.header.cwd;
+          if (found.preset === null && typeof liveSession.header.agentPreset === 'string' && liveSession.header.agentPreset.length > 0) found.preset = liveSession.header.agentPreset;
         }
       }
       return found;
@@ -952,6 +955,107 @@ export default {
       },
     };
 
+    const createTool = {
+      name: 'session_create',
+      description: "Create a brand-new top-level session in this DSH process — not a fork. A fork inherits the source session's history, preset and working directory; a create starts EMPTY, with its own preset and cwd, which is what you want for a fresh worker. Defaults: preset = the caller's own preset (or `standard` when the caller's is unknown), cwd = the caller's working directory. Pass `title` to name it up front, and provider+model to start it on a specific route. Returns the new session id; drive it with session_send.",
+      parameters: {
+        type: 'object',
+        properties: {
+          preset: { type: 'string', description: 'Agent preset id for the new session, e.g. "standard", "ptc", "minimal". Defaults to the caller\'s preset, else "standard".' },
+          cwd: { type: 'string', description: 'Absolute working directory. Defaults to the caller\'s cwd. When it resolves to a registered workspace root, the session is attached to that workspace.' },
+          title: { type: 'string', description: 'Optional title to set immediately (wakes the fresh session once to record it).' },
+          provider: { type: 'string', description: 'Model provider for the new session; requires `model`.' },
+          model: { type: 'string', description: 'Model id for the new session; requires `provider`.' },
+          reasoningEffort: { type: 'string', description: 'Optional reasoning effort when a model is given.' },
+        },
+      },
+      output: OUTPUT,
+      async execute(args, exec) {
+        const controller = requireController();
+        if (controller === null) return fail('sessionController is unavailable in this deployment; session management is not possible here.');
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const requestedPreset = asString(input.preset).trim();
+        const requestedCwd = asString(input.cwd).trim();
+        const title = asString(input.title).trim();
+        const provider = asString(input.provider).trim();
+        const model = asString(input.model).trim();
+        const reasoningEffort = asString(input.reasoningEffort).trim();
+        if ((provider.length === 0) !== (model.length === 0)) {
+          return fail('Pass both provider and model to start the session on a specific route, or neither.');
+        }
+        const caller = callerOf(exec);
+        const cwd = requestedCwd.length > 0 ? requestedCwd : caller.cwd;
+        const preset = requestedPreset.length > 0 ? requestedPreset : (caller.preset !== null ? caller.preset : 'standard');
+
+        // `session.create` accepts workspaceId XOR cwd, and only the workspaceId
+        // form ATTACHES the session to a workspace (the cwd form leaves it
+        // unattached, visible only through its directory). So attach whenever the
+        // requested cwd IS a registered workspace root; an arbitrary
+        // subdirectory keeps its exact cwd instead.
+        const { workspaces } = runtime();
+        let workspace = null;
+        if (cwd !== null && workspaces !== undefined && workspaces !== null && typeof workspaces.resolveByPath === 'function') {
+          try {
+            const found = await workspaces.resolveByPath(cwd);
+            if (found !== undefined && found !== null && found.path === cwd && typeof found.id === 'string') workspace = found;
+          } catch (error) {
+            workspace = null;
+          }
+        }
+        const request = { agentPreset: preset };
+        if (workspace !== null) request.workspaceId = workspace.id;
+        else if (cwd !== null) request.cwd = cwd;
+
+        let created;
+        try {
+          created = await controller.create(request);
+        } catch (error) {
+          const code = codeOf(error);
+          let hint = '';
+          if (code === 'agent-preset/not-found' || code === 'agent-preset/invalid') hint = ' No session was created; check the preset id (the roster is in the mode picker, or in settings).';
+          else if (code === 'workspace/not-found') hint = ' The workspace disappeared between lookup and creation.';
+          return fail(`Creating a session failed: ${messageOf(error)}${hint}`);
+        }
+        const sessionId = created !== null && created !== undefined && typeof created.sessionId === 'string' ? created.sessionId : '';
+        if (sessionId.length === 0) return fail('sessionController.create returned no session id; nothing to report.');
+        const usedPreset = created !== null && created !== undefined && typeof created.agentPreset === 'string' ? created.agentPreset : preset;
+
+        // A created session already has a live (idle) agent, so both of these only
+        // widen what it will do — but they do resume it, which the report says.
+        let titleNote = '';
+        if (title.length > 0) {
+          try {
+            await controller.rename({ sessionId, title });
+            titleNote = `, titled "${title}"`;
+          } catch (error) {
+            titleNote = `, title NOT set (${messageOf(error)})`;
+          }
+        }
+        let modelNote = '';
+        if (provider.length > 0 && model.length > 0) {
+          try {
+            await controller.selectModel({ sessionId, provider, model, ...(reasoningEffort.length === 0 ? {} : { reasoningEffort }) });
+            modelNote = `, model ${provider}/${model}${reasoningEffort.length === 0 ? '' : ` (effort ${reasoningEffort})`}`;
+          } catch (error) {
+            modelNote = `, model NOT set (${messageOf(error)})`;
+          }
+        }
+
+        // Record it in the durable ledger straight away, so the canvas shows it
+        // before the next listing observes it.
+        try {
+          await observe([{ id: sessionId, parentId: null, kind: 'top-level', cwd: workspace !== null ? workspace.path : cwd, title: title.length > 0 ? title : null }]);
+        } catch (error) {
+          // A failed bookkeeping write must not hide the created session.
+        }
+
+        const where = workspace !== null
+          ? `cwd ${workspace.path} (attached to workspace ${workspace.id})`
+          : (cwd !== null ? `cwd ${cwd} (not attached to any workspace)` : 'the deployment default cwd');
+        return ok(`Created ${sessionId}: brand-new top-level session, preset ${usedPreset}, ${where}${titleNote}${modelNote}. It starts with an empty history and a live idle agent. Drive it with session_send (add callback=true to be told when it finishes), and session_read/session_queue/session_stop/session_compact/session_model all work on it like any other session.`);
+      },
+    };
+
     const describeTool = {
       name: 'session_describe',
       description: "Attach, change, or read a private note for one session — one short line saying what that session is FOR, or what you are waiting on from it. The note is NOT the session title: this preset stores it in its own file and never appends it to any session log, so the session list, the sidebar, the trajectory view and every other agent never see it. It is shown by this preset's session_list and, when the Session Canvas plugin is running, under the node on the canvas. Omit `description` to read the current note; pass an empty string to clear it.",
@@ -1137,6 +1241,7 @@ export default {
     ctx.tools.register(stopTool);
     ctx.tools.register(compactTool);
     ctx.tools.register(forkTool);
+    ctx.tools.register(createTool);
     ctx.tools.register(describeTool);
   },
 };

@@ -52,6 +52,7 @@
       - session_stop：取消某个活跃会话的当前轮次，保留它已排队的消息。
       - session_compact：让某个**活着的、空闲的**会话立刻压缩自己的历史（等价于在它自己的界面里跑一次 /compact）：可压缩的那段被替换成一个摘要节点，事务写进它自己的会话日志。目标正在跑一轮、正在压缩、或没有附着 agent（冷会话）时不会压，会明确报出原因。压缩**改写**了它下一次请求能看到的上下文，所以汇报时必须说清。目标 preset 没有组合压缩能力时（例如 minimal）根本没有 /compact 可跑。
       - session_fork：把一个会话在某个“已完成轮次”的边界上分叉成一份独立副本，返回新的 session id。副本继承源会话的 preset 与工作目录，此后有自己独立的日志和 agent，可以和源会话分别管理。
+      - session_create：**新建一个全新的顶层会话**（不是分叉）。分叉继承源会话的历史、preset 与工作目录；create 从**空白历史**开始，preset 与 cwd 都能指定。默认 preset = 你当前会话的 preset（读不到时用 standard），默认 cwd = 你自己的工作目录；当 cwd 正好是已登记工作区的根目录时，新会话会**挂进那个工作区**（于是它出现在侧栏的工作区列表里），否则只按该目录创建。返回新的 session id，之后用 session_send / session_read / session_compact / session_model 照常管理。可给 title 与 provider+model，让它一开始就带名字和路由。
       - session_describe：给某个会话挂一条**只有本包看得到**的私有备注（例如“它在做解析器”“我在等它的结论”）。它**不是会话标题**，不写进任何会话日志，所以侧栏、会话列表、轨迹视图和其他 agent 都看不到；只出现在本模式的 session_list 里，以及画布（读同一份持久记录）的节点与详情里。备注与观测到的血统一起存放在 `<DSH_HOME>/session-manager/state.json`，重启不丢。省略 description 就是读，传空串就是清除。
       - session_models：列出当前可路由的 provider / model 以及各自支持的 reasoning effort，用来挑一个合法组合。
       - session_model：读或改某个会话的模型。只给 sessionId 就是读——next 是它“下一次请求会用的”，lastUsed 是“上一次请求实际跑的”，读取不会唤醒它；同时给 provider 与 model 就是切换，运行中的会话会在下一个 step 生效，不必重启会话或新开分支。代价要说清：切换会把这个模型同时存成“部署默认”（影响之后新建的会话），并且目标会话若是冷的会先被唤醒。
@@ -70,6 +71,7 @@
       10. 排队要看得见：session_send 之后如果想知道它到底处没处理，用 session_queue 看目标还在排什么。队列空而它在 running，说明它正在处理你上一条；队列里还压着你的消息，就不要重复投递。
       11. 上下文也要管：某个会话已经跑了很久、开始反复重读同样的内容，或者你从 session_read 看出它的历史已经很长时，用 session_compact 让它压一次。压缩改写它接下来的上下文，做完在汇报里写明压了哪个会话、压掉了多少。
       12. 委托要留回音：把任务 session_send 出去时带上 callback=true，然后就可以去干别的——目标跑完会把结果排队投回你。收到「[委托回调]」消息就是它交活了；不确定时用 session_delegations 看账本（pending = 还没回音）。**不要靠反复 session_read 去猜它做完没有**。
+      13. 要「新活」就用 create，不要用 fork：需要干净的历史、换一个 preset、或者另开一个工作目录时，用 session_create；只有「在同一份上下文上分两条路对比」才用 session_fork。创建完立刻用 session_send 派活（要回音就 callback=true），并在汇报里写明新 session 的 id、preset 与工作目录。
     suffix: 你自己的会话工作目录是 {{cwd}}。
 
 # ── session management ──────────────────────────────────────────────────────

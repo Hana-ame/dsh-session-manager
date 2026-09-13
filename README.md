@@ -5,12 +5,12 @@
 | 层 | 文件 | 作用 |
 |---|---|---|
 | ① 持久化 | `package/lib/store.mjs` | 每个会话的**关系信息**（父子、类型、目录、标题）与 **describe 私有备注**，落在 `<DSH_HOME>/session-manager/state.json`，重启不丢 |
-| ② 管理工具 | `package/lib/tools.mjs` | 11 个会话管理工具：读写 ①、指挥本进程内的其他会话、**委托带回音** |
+| ② 管理工具 | `package/lib/tools.mjs` | 12 个会话管理工具：读写 ①、指挥本进程内的其他会话、**新建会话**、**委托带回音** |
 | ③ 画布 | `package/lib/client.js` | 把这些持久化数据画成关系图（当前工作区，观察窗口） |
 
 配套的 `preset/` 是「会话管理」agent preset：**这个模式下的会话只用来管理其他会话**。它不写代码、不改文件、不跑命令、不访问网络，只能观察、分叉、标注、压缩、指挥本进程内的其他会话，并在这些会话与用户之间协调信息。
 
-> **想改这个包？先读 [`docs/DESIGN.md`](docs/DESIGN.md)**：设计意图、架构图、各层职责、八个关键决策的取舍（为什么一个包两个挂载点、为什么 ① 是模块而不是 Cordis 服务、为什么画布走同源路由、为什么委托回调是无状态轮询）、典型数据流、边界，以及「改哪一层要不要重启」。
+> **想改这个包？先读 [`docs/DESIGN.md`](docs/DESIGN.md)**：设计意图、架构图、各层职责、九个关键决策的取舍（为什么一个包两个挂载点、为什么 ① 是模块而不是 Cordis 服务、为什么画布走同源路由、为什么委托回调是无状态轮询、为什么新建会话要判一次 `workspaceId`/`cwd`）、典型数据流、边界，以及「改哪一层要不要重启」。
 
 ## 目录结构
 
@@ -64,6 +64,7 @@ install.sh                           # 一次装好：package + preset + profile
 | `session_stop` | 取消某活跃会话的当前轮次，保留其已排队消息 |
 | `session_compact` | 要求某**活着且空闲**的会话立刻压缩自己的历史：在它自己的作用域里跑它的 `/compact`，可压缩段被替换成一个摘要节点 |
 | `session_fork` | 在某个**已完成轮次**的边界上把会话分叉成独立副本，返回新的 session id |
+| `session_create` | **新建**一个全新的顶层会话（**空历史**，不是分叉）：可指定 `preset` / `cwd` / `title` / `provider`+`model`，返回新 id。默认 preset = 调用者自己的 preset（读不到则 `standard`），默认 cwd = 调用者的工作目录 |
 | `session_describe` | 给某个会话读 / 挂 / 清一条私有备注，写进 ① |
 | `session_models` | 列出当前可路由的 provider / model 与各自支持的 reasoning effort |
 | `session_model` | 读某个会话的模型路由（`next` / `lastUsed`），或**中途切换**它 |
@@ -188,6 +189,24 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 - **给 provider + model = 切换**，走 `sessionController.selectModel`。因为是逐请求生效，**运行中的会话在下一个 step 就会用新模型**。只给一半会被拒绝并提示。
 - **两个副作用必须知道**：`selectModel` 还会 `agentDefaultModel.saveSelection(...)`（把这次选择**同时存成部署默认**，影响之后新建的会话），并且会先 `resolveAgent`（**冷会话被唤醒**）。
 
+## 新建会话 vs 分叉（`session_create` / `session_fork`）
+
+| | `session_create` | `session_fork` |
+|---|---|---|
+| 历史 | **空** | 继承到切点为止 |
+| preset | 任意指定（默认跟调用者） | 继承源会话 |
+| cwd | 任意指定（默认跟调用者） | 继承源会话 |
+| 用途 | 派一份**全新**的活、换个 preset、另开一个工作目录 | 在**同一份上下文**上分两条路对比 |
+
+`session_create({preset?, cwd?, title?, provider?, model?, reasoningEffort?})` → 返回新 session id。
+
+- **preset 默认值**：先取调用者会话记录里的 `agentPreset`，取不到才用 `standard`。所以「会话管理」会话默认会造出**另一个「会话管理」会话**；要派编码活就显式传 `preset:"standard"` 或 `"ptc"`。
+- **cwd 与工作区**：底层 `sessionController.create` 只接受 **`workspaceId` 或 `cwd` 二选一**（同时给直接 `gateway/bad-request`），而且**只有 `workspaceId` 那条路会把会话挂进工作区**。所以工具先查一次 `workspaceRegistry.resolveByPath(cwd)`：
+  - cwd 正好是**已登记工作区的根目录** → 传 `workspaceId`，会话挂进该工作区（出现在侧栏的工作区里）；
+  - 否则 → 原样传 `cwd`，会话**不**挂任何工作区（画布仍会按目录把它画出来）。
+- **title** 调一次 `rename`，**provider+model** 调一次 `selectModel`：这个新建的会话本来就有一个 idle 的活 agent，这两个调用会让它再醒一下；`selectModel` 还会把该模型顺带存成**部署默认**（与 `session_model` 同一个副作用）。任一步失败都**不会**丢掉已创建的 session——结果里会写「title NOT set / model NOT set」，id 照常返回。
+- 新会话会立刻写进 ①（顶层、cwd、标题），所以画布在下一次 `session_list` 之前就能看到它。
+
 ## 分叉语义
 
 `session_fork({ sessionId, atSeq?, title? })`：
@@ -217,11 +236,11 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 ## 测试
 
 ```sh
-node package/test/tools.test.mjs     # 工具层 77 项
+node package/test/tools.test.mjs     # 工具层 90 项
 node package/test/scope.test.mjs     # 画布作用域 18 项
 ```
 
-工具层用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：① 的迁移 / 落盘 / 不再重复落盘 / 清备注保留血统，`session_list` 的血统标注、备注、模型路由与观测落库，`session_read` 三档 detail，模型目录的渲染与失败项，模型**读取**（优先 projection、回退 fold、不 resume）与**切换**（字段完整、半对参数被拒、副作用披露），发送/自投递/空文本拦截、取消、分叉与自动命名，排队消息读取（顺序、`placement`、截断、空队列、冷会话、读完即释放控制流、只读性），压缩（替目标跑 `/compact`、传出真实信号与空附件、拒绝结果、无压缩 preset、冷会话、自压缩拦截），以及**委托回调**（记账、任务摘要、无 callback 不记账、无调用者身份被拒、watcher 定时器注册、结案带答复、结果投回委托方、已结案不重复通知、失败轮次带原因、接纳之前的 `turn/end` 不算数、状态过滤、`session_queue` 的委托标记、`dismiss`）。
+工具层用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：① 的迁移 / 落盘 / 不再重复落盘 / 清备注保留血统，`session_list` 的血统标注、备注、模型路由与观测落库，`session_read` 三档 detail，模型目录的渲染与失败项，模型**读取**（优先 projection、回退 fold、不 resume）与**切换**（字段完整、半对参数被拒、副作用披露），发送/自投递/空文本拦截、取消、分叉与自动命名，排队消息读取（顺序、`placement`、截断、空队列、冷会话、读完即释放控制流、只读性），压缩（替目标跑 `/compact`、传出真实信号与空附件、拒绝结果、无压缩 preset、冷会话、自压缩拦截），以及**委托回调**（记账、任务摘要、无 callback 不记账、无调用者身份被拒、watcher 定时器注册、结案带答复、结果投回委托方、已结案不重复通知、失败轮次带原因、接纳之前的 `turn/end` 不算数、状态过滤、`session_queue` 的委托标记、`dismiss`）与**新建会话**（返回 id、默认 preset 与 cwd、`workspaceId`/`cwd` 互斥分流、显式 preset、`title` 与 `selectModel` 调用、继承调用者 preset、半个模型对被拒、未知 preset 的引导、title 失败不丢 session、写入 ①）。
 
 作用域测试用 `new Function` 从**真实 bundle** 里切出作用域纯函数再断言，所以断言跑的是出货文件本身；helper 的注释标记一旦移动，测试会直接报错而不是静默通过。
 

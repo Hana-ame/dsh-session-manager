@@ -35,6 +35,8 @@ const controlSignals = []
 const logs = {}
 /** The callbacks the plugin registered on the timer service, so ticks are manual. */
 const ticks = []
+/** How many sessions the fake `create` has handed out. */
+let created = 0
 
 const events = [
   { type: 'user/message', seq: 1, time: 1000, data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'hello there' }], source: { kind: 'user' } } },
@@ -78,7 +80,25 @@ const controller = {  list: async () => ({ items: [
     })()
   },
   fork: async (request) => { calls.push(['fork', request.sessionId, String(request.atSeq)]); return { sessionId: 'session-forked' } },
-  rename: async (request) => { calls.push(['rename', request.sessionId, request.title]); return { title: request.title, seq: 99 } },
+  create: async (request) => {
+    calls.push(['create', JSON.stringify(request)])
+    if (request.agentPreset === 'nope') {
+      const error = new Error('no agent preset named "nope"')
+      error.code = 'agent-preset/not-found'
+      throw error
+    }
+    created += 1
+    return { sessionId: `session-new-${created}`, agentPreset: request.agentPreset }
+  },
+  rename: async (request) => {
+    calls.push(['rename', request.sessionId, request.title])
+    if (request.title === 'boom') {
+      const error = new Error('title rejected')
+      error.code = 'gateway/internal'
+      throw error
+    }
+    return { title: request.title, seq: 99 }
+  },
   modelCatalog: async () => ({
     default: { provider: 'p1', model: 'm1' },
     routableProviders: ['p1', 'p2'],
@@ -109,11 +129,18 @@ const commands = {
 /** Everything has a live agent here except `session-cold`, which never attached. */
 const agents = { get: (id) => (id === 'session-cold' ? undefined : { id }) }
 
+/**
+ * The durable workspace registry. `/tmp/repo` is a registered workspace root, so
+ * a session created there is ATTACHED (workspaceId form); any other directory is
+ * not, and keeps its exact cwd.
+ */
+const workspaces = { resolveByPath: async (path) => (path === '/tmp/repo' ? { id: 'ws-1', path: '/tmp/repo' } : undefined) }
+
 /** The timer service, captured so the test decides when the watcher runs. */
 const timer = { interval: (callback) => { ticks.push(callback); return () => {} } }
 
 register.apply({
-  get: (name) => (name === 'sessionController' ? controller : (name === 'commands' ? commands : (name === 'agents' ? agents : (name === 'timer' ? timer : undefined)))),
+  get: (name) => (name === 'sessionController' ? controller : (name === 'commands' ? commands : (name === 'agents' ? agents : (name === 'timer' ? timer : (name === 'workspaceRegistry' ? workspaces : undefined))))),
   tools: { register: (definition) => { captured[definition.name] = definition } },
 })
 
@@ -127,8 +154,8 @@ const check = (label, condition, detail) => {
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-check('eleven tools registered', same(Object.keys(captured).sort(), [
-  'session_compact', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
+check('twelve tools registered', same(Object.keys(captured).sort(), [
+  'session_compact', 'session_create', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
 ]), Object.keys(captured).join(','))
 
 // The pre-0.2 note file must survive an in-place upgrade. Seed one before the
@@ -326,6 +353,40 @@ check('dismiss forgets a row',
   (await captured.session_delegations.execute({ dismiss: toDismiss.id }, callerExec)).text.includes(`Forgot delegation ${toDismiss.id}`))
 check('the dismissed row is gone',
   (await ledger()).length === 2 && (await ledger()).every((row) => row.id !== toDismiss.id))
+
+// session_create: a brand-new top-level session, not a fork
+const createCalls = () => calls.filter((row) => row[0] === 'create').map((row) => JSON.parse(row[1]))
+const createdOne = await captured.session_create.execute({}, callerExec)
+check('create returns the new session id',
+  createdOne.ok === true && createdOne.text.includes('session-new-1'), createdOne.text)
+check('create attaches when the cwd is a registered workspace root',
+  same(createCalls()[0], { agentPreset: 'standard', workspaceId: 'ws-1' }), JSON.stringify(createCalls()[0]))
+check('create reports the preset, the workspace and the id',
+  createdOne.text.includes('preset standard') && createdOne.text.includes('attached to workspace ws-1') && createdOne.text.includes('empty history'), createdOne.text)
+const createdTwo = await captured.session_create.execute({ preset: 'ptc', cwd: '/tmp/elsewhere', title: 'worker', provider: 'p2', model: 'm9', reasoningEffort: 'high' }, callerExec)
+check('create honours an explicit preset', createCalls()[1].agentPreset === 'ptc')
+check('an unregistered cwd is passed as cwd, never together with a workspace',
+  createCalls()[1].cwd === '/tmp/elsewhere' && createCalls()[1].workspaceId === undefined, JSON.stringify(createCalls()[1]))
+check('create titles the new session',
+  calls.some((row) => row[0] === 'rename' && row[1] === 'session-new-2' && row[2] === 'worker'))
+check('create starts it on the requested route',
+  calls.some((row) => row[0] === 'selectModel' && row[1] === 'session-new-2' && row[2] === 'p2' && row[3] === 'm9' && row[4] === 'high'))
+check('create reports the route and the non-attachment',
+  createdTwo.text.includes('model p2/m9') && createdTwo.text.includes('not attached to any workspace'), createdTwo.text)
+await captured.session_create.execute({}, { agent: { id: 'me', session: { header: { cwd: '/tmp/repo', agentPreset: 'ptc' } } } })
+check('create inherits the caller preset when one is recorded', createCalls()[2].agentPreset === 'ptc')
+check('create refuses half a model pair',
+  (await captured.session_create.execute({ provider: 'p2' }, callerExec)).ok === false)
+const badPreset = await captured.session_create.execute({ preset: 'nope' }, callerExec)
+check('an unknown preset fails with guidance',
+  badPreset.ok === false && badPreset.text.includes('check the preset id'), badPreset.text)
+const boomTitle = await captured.session_create.execute({ title: 'boom' }, callerExec)
+check('a failed title does not lose the created session',
+  boomTitle.ok === true && boomTitle.text.includes('title NOT set') && boomTitle.text.includes('session-new-'), boomTitle.text)
+const afterCreate = JSON.parse(await readFile(statePath, 'utf8'))
+check('the created session is recorded in the durable ledger',
+  afterCreate.byId['session-new-1'] !== undefined && afterCreate.byId['session-new-1'].kind === 'top-level' && afterCreate.byId['session-new-1'].cwd === '/tmp/repo',
+  JSON.stringify(afterCreate.byId['session-new-1']))
 
 const failures = results.filter((row) => row[0] === 'FAIL')
 for (const [status, label, detail] of results) console.log(`${status}  ${label}${detail}`)

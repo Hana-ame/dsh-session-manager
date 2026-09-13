@@ -90,16 +90,16 @@
 
 ### ② `lib/tools.mjs` — 管理工具
 
-11 个工具按意图分四类：
+12 个工具按意图分四类：
 
 | 类别 | 工具 | 写 ① 吗 |
 |---|---|---|
 | 观察 | `session_list`、`session_read`、`session_queue`、`session_delegations` | `session_list` 会（观测血缘）；`session_delegations` 会（结案委托，见 D8）；另两个不会 |
-| 驱动 | `session_send`、`session_stop`、`session_compact`、`session_fork` | `session_send(callback)` 会记账；其余只写目标会话日志 |
+| 驱动 | `session_send`、`session_stop`、`session_compact`、`session_fork`、`session_create` | `session_send(callback)` 会记账、`session_create` 会记下新会话；其余只写目标会话日志 |
 | 记录 | `session_describe` | 会 |
 | 模型 | `session_models`、`session_model` | 不会 |
 
-**Plane 规则**：这一层消费 host 的 `tools`、`sessionController`、`agents`、`commands` 注册表，**自己一个服务都不发布**，所以它在 preset 组合里必须**裸放**（不能进 `isolate` realm）——进了 realm 它会去解析一个此 preset 从未填充的私有注册表，结果是工具静默地什么都不贡献。这条在 `agent.cordis.yml` 的注释里也写了一遍，因为它是「改组合时最容易踩」的那条。
+**Plane 规则**：这一层消费 host 的 `tools`、`sessionController`、`agents`、`commands`、`workspaceRegistry` 注册表，**自己一个服务都不发布**，所以它在 preset 组合里必须**裸放**（不能进 `isolate` realm）——进了 realm 它会去解析一个此 preset 从未填充的私有注册表，结果是工具静默地什么都不贡献。这条在 `agent.cordis.yml` 的注释里也写了一遍，因为它是「改组合时最容易踩」的那条。
 
 ### host 半 `lib/index.js` — 桥
 
@@ -230,6 +230,14 @@ for await (const frame of controller.control(abort.signal)) {
 
 **代价**：5 秒粒度（不是即时）；每个 tick 只在存在 `pending` 时才读盘，所以空闲代价约为一次内存判断。若部署里没有 `timer` 服务，推送这条腿不启用，但 `session_delegations` 的拉取仍然工作（它读之前强制跑一遍检查）——推送是尽力而为，账本才是真相。
 
+### D9 新建会话：底层是 `workspaceId` 异或 `cwd`，所以工具自己判一次
+
+`sessionController.create` 的请求里 `workspaceId` 与 `cwd` **互斥**（同时给直接 `gateway/bad-request`），而且只有 `workspaceId` 那条路会 `attachSession` 进工作区注册表——走 `cwd` 创建的会话**不属于任何工作区**。UI 的工作区列表只认注册表；画布两条都认（它按 cwd 归属判断）。
+
+所以 `session_create` 的策略是「能挂就挂」：先 `workspaceRegistry.resolveByPath(cwd)`，**只有当返回的 `workspace.path` 恰好等于请求的 `cwd`** 时才用 `workspaceId`（此时 cwd 本就是工作区根目录，语义等价，还额外拿到归属），否则原样传 `cwd` 保住精确目录，并在结果里明说「未挂进任何工作区」。这样既不让新建的会话在侧栏里失踪，也不牺牲 cwd 精度。
+
+**代价**：一次额外的工作区查询；以及当 cwd 是工作区子目录时「挂进工作区」与「精确 cwd」不可兼得——这是底层 API 的互斥决定的，不是这里的选择。另外 `session_create` 与 `session_fork` 的定位必须写清：**fork 继承历史与 preset，create 从空白开始**，所以「要一份新的活」用 create，「在同一份上下文上分两条路」才用 fork。
+
 ## 5. 四条典型数据流
 
 **A. 协调者列一次表**
@@ -309,7 +317,7 @@ for await (const frame of controller.control(abort.signal)) {
 ## 8. 怎么验证
 
 ```sh
-node package/test/tools.test.mjs    # ② 与 ①：77 项
+node package/test/tools.test.mjs    # ② 与 ①：90 项
 node package/test/scope.test.mjs    # ③ 的纯函数：18 项
 dsh --profile web --dump-config | grep -A1 session-manager   # profile 行进了组合
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3080/session-manager/state   # 200 = host 半活着
