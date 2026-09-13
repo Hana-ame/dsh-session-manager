@@ -11,7 +11,7 @@ preset/                              # 可直接使用的 agent preset（拷进 
 ├── agent.cordis.yml                 # Cordis 组合
 ├── preset.yml                       # 显示名与描述
 └── tools/
-    ├── session-control.mjs          # 6 个会话管理工具的持久实现
+    ├── session-control.mjs          # 8 个会话管理工具的持久实现
     └── session-control.test.mjs     # 冒烟测试（假 ctx + 临时 DSH_HOME，不碰真实状态）
 
 plugins/session-canvas/              # 动态 Cordis 包源码（不是 ES module，见下）
@@ -37,6 +37,8 @@ DSH 的 preset 发现每次都会重读 roots，所以**不需要重启**：新�
 | `session_stop` | 取消某活跃会话的当前轮次，保留其已排队消息 |
 | `session_fork` | 在某个**已完成轮次**的边界上把会话分叉成独立副本，返回新的 session id |
 | `session_describe` | 给某个会话挂 / 读 / 清一条**只有本 preset 看得到**的私有备注 |
+| `session_models` | 列出当前可路由的 provider / model 与各自支持的 reasoning effort |
+| `session_model` | 读某个会话的模型路由（`next` / `lastUsed`），或**中途切换**它 |
 
 组合里还有 `persona`（协调者人格）、`ask_user_question`、`todo_write`、goal 与 compaction。
 
@@ -62,6 +64,22 @@ DSH 的 preset 发现每次都会重读 roots，所以**不需要重启**：新�
 - 写入串行化（`withNotes` 用一条 promise 链），并发调用不会丢更新；写盘失败会把内存缓存回滚。
 - **它不是保密边界**：文件就在 DSH home 里，任何进程都能打开。它是**归属边界**——除了这个 preset，没有别的东西读写它。
 
+## 中途切换模型
+
+`session_models()` 列出 `sessionController.modelCatalog()` 的内容：部署默认、可路由 provider、按 provider 分组的 model（带各自的 reasoning effort 与默认 effort），以及**发现失败**的 provider（没有凭据之类）。catalog 只是提示，不控制路由。
+
+`session_model({ sessionId, provider?, model?, reasoningEffort? })`：
+
+- **只给 sessionId = 读**。走的是 `modelSelection` 这个 session projection（`wire.view` 是 `{ lastUsed, next }`，随 `session_list` 一起下发），**冷会话也能读，且不会唤醒它**；该会话没有 projection 缓存时，插件自己 fold 日志（最后一条 `model/selection` 是 pending，最后一条 `request/header` 是实际用过的路由）作为回退。
+  - `next` = 下一次请求会用哪个；`lastUsed` = 上一次记录下来的请求实际跑在哪个模型上。
+- **给 provider + model = 切换**，走 `sessionController.selectModel` → `agent.session.append("model/selection", …)` + 设置下一次请求的选择。因为是逐请求生效，**运行中的会话在下一个 step 就会用新模型**，不用重启会话，也不用新开分支。只给一半（只有 provider 或只有 model）会被拒绝并提示。
+- **两个副作用必须知道**：
+  1. `selectModel` 内部还会 `agentDefaultModel.saveSelection(...)`，也就是把这次选择**同时存成部署默认**——之后新建的会话会从这个模型起步（UI 里的模型选择器行为相同）；
+  2. 它会先 `resolveAgent`，所以**冷的会话会被唤醒**成一个 idle 的活会话。
+- 失败码：`session/model-unavailable`（provider/model 不可路由，或该模型不支持指定的 reasoning effort）、`session/not-found`、`session/agent-busy`（目标是被 subagent routing 拥有的子会话）。
+
+`session_list` 的每一行也会带 `| model provider/model`（没有 projection 时显示 `(unknown)`），这样协调者不必逐个读就能看出谁跑在贵模型上。
+
 ## 分叉语义
 
 `session_fork({ sessionId, atSeq?, title? })`：
@@ -80,7 +98,7 @@ DSH 的 preset 发现每次都会重读 roots，所以**不需要重启**：新�
 node preset/tools/session-control.test.mjs
 ```
 
-它用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：备注的写/读/清与落盘、`session_list` 的血统标注与备注展示、`session_read` 三档 detail 的取舍与顺序、发送/自投递拦截/空文本拦截/取消/分叉与自动命名。全部通过时退出码 0。
+它用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：备注的写/读/清与落盘、`session_list` 的血统标注 / 备注 / 模型路由展示、`session_read` 三档 detail 的取舍与顺序、模型目录的渲染与失败项、模型**读取**（优先 projection、回退 fold 日志、不触发 resume）、模型**切换**（请求字段完整、半对参数被拒、副作用被披露）、发送/自投递拦截/空文本拦截/取消/分叉与自动命名。全部通过时退出码 0。
 
 ## 使用画布
 

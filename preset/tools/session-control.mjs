@@ -158,6 +158,69 @@ const titleOf = async (controller, sessionId) => {
   return null;
 };
 
+/** Normalize one { provider, model, reasoningEffort? } selection, or null. */
+const selectionOf = (value) => {
+  if (value === null || value === undefined || typeof value !== 'object') return null;
+  if (typeof value.provider !== 'string' || typeof value.model !== 'string') return null;
+  return {
+    provider: value.provider,
+    model: value.model,
+    reasoningEffort: typeof value.reasoningEffort === 'string' ? value.reasoningEffort : null,
+  };
+};
+
+/** Read the wired `modelSelection` projection view ({ lastUsed, next }) off one session-list row. */
+const routeFromProjection = (value) => {
+  if (value === null || value === undefined || typeof value !== 'object') return null;
+  return { lastUsed: selectionOf(value.lastUsed), next: selectionOf(value.next) };
+};
+
+/**
+ * The model route of one session, cold-safe and without resuming it: prefer the
+ * wired `modelSelection` projection carried by the session list, and fall back to
+ * folding the log ourselves when that session has no projection cache entry.
+ * `next` is what the NEXT request will use (a pending switch), `lastUsed` is the
+ * route the last recorded request actually ran on.
+ */
+const routeOf = async (controller, sessionId) => {
+  try {
+    const listed = await controller.list({}, undefined);
+    const items = listed !== null && listed !== undefined && Array.isArray(listed.items) ? listed.items : [];
+    for (const item of items) {
+      if (item === null || typeof item !== 'object' || item.sessionId !== sessionId) continue;
+      const projections = item.projections;
+      if (projections === null || projections === undefined || typeof projections !== 'object') break;
+      const values = projections.values;
+      if (values === null || values === undefined || typeof values !== 'object') break;
+      const route = routeFromProjection(values.modelSelection);
+      if (route !== null) return route;
+      break;
+    }
+  } catch (error) {
+    // fall through to folding the log
+  }
+  const inspection = await controller.inspect(sessionId, undefined);
+  const events = inspection !== null && inspection !== undefined && Array.isArray(inspection.events) ? inspection.events : [];
+  let lastUsed = null;
+  let pending = null;
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue;
+    if (event.type === 'model/selection') {
+      const picked = selectionOf(event.data);
+      if (picked !== null) pending = picked;
+    } else if (event.type === 'request/header') {
+      const data = event.data;
+      const header = data !== null && typeof data === 'object' ? data.header : undefined;
+      const used = selectionOf(header !== null && header !== undefined ? header.config : undefined);
+      if (used !== null) {
+        lastUsed = used;
+        if (pending !== null && pending.provider === used.provider && pending.model === used.model && pending.reasoningEffort === used.reasoningEffort) pending = null;
+      }
+    }
+  }
+  return { lastUsed, next: pending !== null ? pending : lastUsed };
+};
+
 /** Collect the readable text of one content-block list, eliding the noisy kinds. */
 const textOf = (blocks, includeReasoning) => {
   if (!Array.isArray(blocks)) return '';
@@ -267,10 +330,14 @@ export default {
           if (scope === 'workspace' && (targetCwd === null || cwd !== targetCwd)) continue;
           if (runningOnly && item.running !== true) continue;
           let title = null;
+          let route = null;
           const projections = item.projections;
           if (projections !== null && projections !== undefined && typeof projections === 'object') {
             const values = projections.values;
-            if (values !== null && values !== undefined && typeof values === 'object' && typeof values.title === 'string' && values.title.length > 0) title = values.title;
+            if (values !== null && values !== undefined && typeof values === 'object') {
+              if (typeof values.title === 'string' && values.title.length > 0) title = values.title;
+              route = routeFromProjection(values.modelSelection);
+            }
           }
           const parentId = typeof item.parentSessionId === 'string' ? item.parentSessionId : null;
           const isSubagent = item.origin === 'subagent';
@@ -287,6 +354,7 @@ export default {
             id,
             cwd,
             title,
+            route,
             running: item.running === true,
             isSubagent,
             isFork: !isSubagent && parentId !== null,
@@ -313,10 +381,11 @@ export default {
               + ` | ${row.title === null ? '(untitled)' : row.title}`
               + ` | updated ${row.updatedAt === null ? 'unknown' : row.updatedAt}`
               + ` | cwd ${row.cwd === null ? '(none)' : row.cwd}`
+              + ` | model ${row.route === null ? '(unknown)' : row.route.next === null ? '(unset)' : `${row.route.next.provider}/${row.route.next.model}`}`
               + (row.note === null ? '' : `\n    note: ${row.note}`),
             );
           }
-          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_describe attaches a private note only this preset can see. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
+          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_model reads or switches its model mid-run; session_describe attaches a private note only this preset can see. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
         }
         return ok(lines.join('\n'));
       },
@@ -613,6 +682,133 @@ export default {
       },
     };
 
+    const modelsTool = {
+      name: 'session_models',
+      description: 'List every model route this deployment can currently reach, grouped by provider, with each model\'s reasoning efforts. Use it to pick a valid provider/model pair for session_model. The catalog is advisory — membership never changes routing — and it reports providers whose discovery failed.',
+      parameters: {},
+      output: OUTPUT,
+      async execute() {
+        const controller = requireController();
+        if (controller === null) return fail('sessionController is unavailable in this deployment; model routing is not possible here.');
+        let catalog;
+        try {
+          catalog = await controller.modelCatalog();
+        } catch (error) {
+          return fail(`Reading the model catalog failed: ${messageOf(error)}`);
+        }
+        if (catalog === null || catalog === undefined || typeof catalog !== 'object') return fail('The model catalog came back empty.');
+
+        const show = (selection) => (selection === null
+          ? '(unset)'
+          : `${selection.provider}/${selection.model}${selection.reasoningEffort === null ? '' : ` (effort ${selection.reasoningEffort})`}`);
+        const lines = [];
+        lines.push(`deployment default: ${show(selectionOf(catalog.default))}`);
+        const providers = Array.isArray(catalog.routableProviders) ? catalog.routableProviders : [];
+        lines.push(`routable providers: ${providers.length === 0 ? '(none)' : providers.join(', ')}`);
+
+        const groups = Array.isArray(catalog.groups) ? catalog.groups : [];
+        for (const group of groups) {
+          if (group === null || typeof group !== 'object') continue;
+          const providerId = typeof group.id === 'string' ? group.id : String(group.id);
+          const displayName = typeof group.name === 'string' && group.name.length > 0 ? ` (${group.name})` : '';
+          lines.push(`- ${providerId}${displayName}:`);
+          const models = Array.isArray(group.models) ? group.models : [];
+          if (models.length === 0) lines.push('    (no models listed)');
+          for (const model of models) {
+            if (model === null || typeof model !== 'object' || typeof model.id !== 'string') continue;
+            const label = typeof model.name === 'string' && model.name.length > 0 && model.name !== model.id ? ` (${model.name})` : '';
+            const reasoning = model.reasoning;
+            let effortNote = '';
+            if (reasoning !== null && reasoning !== undefined && typeof reasoning === 'object' && Array.isArray(reasoning.efforts)) {
+              const efforts = reasoning.efforts
+                .map((effort) => (effort !== null && typeof effort === 'object' && typeof effort.id === 'string' ? effort.id : ''))
+                .filter((id) => id.length > 0);
+              if (efforts.length > 0) {
+                const fallback = typeof reasoning.defaultEffort === 'string' ? ` (default ${reasoning.defaultEffort})` : '';
+                effortNote = ` | efforts: ${efforts.join('/')}${fallback}`;
+              }
+            }
+            lines.push(`    ${providerId}/${model.id}${label}${effortNote}`);
+          }
+        }
+
+        const failures = Array.isArray(catalog.failures) ? catalog.failures : [];
+        if (failures.length > 0) {
+          lines.push('providers whose model discovery failed:');
+          for (const failure of failures) {
+            if (failure === null || typeof failure !== 'object') continue;
+            lines.push(`    ${String(failure.id)}: ${typeof failure.message === 'string' ? failure.message : 'unknown failure'}`);
+          }
+        }
+        return ok(lines.join('\n'));
+      },
+    };
+
+    const modelTool = {
+      name: 'session_model',
+      description: "Read or switch the model route of one session, mid-conversation. With neither provider nor model it reports that session's route: `next` is what its NEXT request will use and `lastUsed` is the route its last recorded request actually ran on — reading does not wake the session. With provider AND model it installs the new route for the next request, so a running session picks it up at its next step. Run session_models first for valid ids.",
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable target session id, from session_list.' },
+          provider: { type: 'string', description: 'Provider route to switch to, from session_models. Pass together with model.' },
+          model: { type: 'string', description: 'Exact model id to switch to, from session_models. Pass together with provider.' },
+          reasoningEffort: { type: 'string', description: 'Optional reasoning effort id the target model supports. Omit to keep the model default.' },
+        },
+        required: ['sessionId'],
+      },
+      output: OUTPUT,
+      async execute(args) {
+        const controller = requireController();
+        if (controller === null) return fail('sessionController is unavailable in this deployment; model routing is not possible here.');
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        if (sessionId.length === 0) return fail('sessionId is required.');
+        const provider = asString(input.provider).trim();
+        const model = asString(input.model).trim();
+        const reasoningEffort = asString(input.reasoningEffort).trim();
+
+        const show = (selection) => (selection === null
+          ? '(unset)'
+          : `${selection.provider}/${selection.model}${selection.reasoningEffort === null ? '' : ` (effort ${selection.reasoningEffort})`}`);
+
+        if (provider.length === 0 && model.length === 0) {
+          try {
+            const route = await routeOf(controller, sessionId);
+            return ok(`session ${sessionId}\n  next request will use: ${show(route.next)}\n  last request ran on:   ${show(route.lastUsed)}\n\nReading the route does not wake the session.`);
+          } catch (error) {
+            const hint = codeOf(error) === 'session/not-found' ? ' No persisted session has that id.' : '';
+            return fail(`Reading the model route of ${sessionId} failed: ${messageOf(error)}${hint}`);
+          }
+        }
+        if (provider.length === 0 || model.length === 0) {
+          return fail('Pass both provider and model to switch, or neither to read the current route.');
+        }
+
+        const request = { sessionId, provider, model };
+        if (reasoningEffort.length > 0) request.reasoningEffort = reasoningEffort;
+        let result;
+        try {
+          result = await controller.selectModel(request);
+        } catch (error) {
+          const code = codeOf(error);
+          let hint = '';
+          if (code === 'session/model-unavailable') hint = ' That provider/model — or that reasoning effort — is not routable; run session_models to see what is.';
+          else if (code === 'session/not-found') hint = ' No persisted session has that id.';
+          else if (code === 'session/agent-busy') hint = ' The target is owned by subagent routing (a subagent child).';
+          return fail(`Switching ${sessionId} failed: ${messageOf(error)}${hint}`);
+        }
+        const selected = selectionOf(result !== null && result !== undefined ? result.selected : undefined);
+        const shown = selected === null ? `${provider}/${model}` : show(selected);
+        return ok(
+          `session ${sessionId} now uses ${shown} for its next request. The switch is mid-conversation: a running session applies it at its next step.\n`
+          + 'Two side effects worth knowing: the target was resumed (and is now an idle live session) if it was cold, and the harness also stored this route as the deployment default for sessions created later.',
+        );
+      },
+    };
+
+    ctx.tools.register(modelsTool);
+    ctx.tools.register(modelTool);
     ctx.tools.register(listTool);
     ctx.tools.register(readTool);
     ctx.tools.register(sendTool);
