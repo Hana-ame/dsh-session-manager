@@ -10,6 +10,8 @@
 
 配套的 `preset/` 是「会话管理」agent preset：**这个模式下的会话只用来管理其他会话**。它不写代码、不改文件、不跑命令、不访问网络，只能观察、分叉、标注、压缩、指挥本进程内的其他会话，并在这些会话与用户之间协调信息。
 
+> **想改这个包？先读 [`docs/DESIGN.md`](docs/DESIGN.md)**：设计意图、架构图、各层职责、七个关键决策的取舍（为什么一个包两个挂载点、为什么 ① 是模块而不是 Cordis 服务、为什么画布走同源路由）、典型数据流、边界，以及「改哪一层要不要重启」。
+
 ## 目录结构
 
 ```
@@ -28,6 +30,8 @@ package/                             # @local/dsh-session-manager：唯一的包
 preset/                              # 挂 ② 的 agent preset
 ├── agent.cordis.yml                 # 组合；工具行按相对路径指回 package/
 └── preset.yml                       # 显示名与描述
+
+docs/DESIGN.md                       # 设计文档：理念、架构、各层职责、取舍与验证
 
 install.sh                           # 一次装好：package + preset + profile 行
 ```
@@ -162,7 +166,8 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 
 - **只画当前工作区**：以 `shell.overlay` 标准 prop `useWorkspaces` 的 Workspace 投影为准，用与侧栏完全相同的推导（`items.find(item => item.sessionIds.includes(current))`）选出当前会话所属工作区；保留「该工作区登记的会话 ∪ cwd 位于工作区路径之下的会话（子会话常起在子目录）∪ 已保留会话的全部后代」。当前会话本身是子会话/分叉时，沿 `parentSessionId` 上溯。**找不到工作区时画 0 个节点**（并在画布上写明原因），不会退回「全部工作区」。
 - **读的是持久化数据**：图 = `session.list`（活会话）∪ ① 里还记着、但已经不在活列表里的会话（归档/删除过的，画成虚线灰底的 `remembered` 节点）。每个节点上的 `✎` 就是它的 describe 备注，详情栏里也有。
-- **两条数据通路**：`remote.session.list` 走已有 Remote 命名空间；① 走本包 host 半提供的 `GET /session-manager/state`（同源，带页面自己的凭据）。两条路各自失败互不拖累：store 读不到时画布退化成「只有活会话」，并在标题栏写明原因。
+- **两条数据通路**：`remote.session.list` 走已有 Remote 命名空间；① 走本包 host 半提供的 `GET /session-manager/state`。两条路各自失败互不拖累：store 读不到时画布退化成「只有活会话」，并在标题栏写明原因。
+  > 那条路由**自身不鉴权**（不像页面那样要求凭据），但服务只绑在 `127.0.0.1`，返回的内容与 `<DSH_HOME>/session-manager/state.json` 完全一致——同一个本地用户本来就能读那个文件，所以它没有扩大暴露面。**它不是保密边界**。
 - 交互：拖拽平移、`−`/`+` 缩放、「适应」重排、点节点看详情；每 4 秒刷新。
 
 > 客户端半必须声明 `inject: ['remote', 'remote.session', 'slots']`。`remote.session` 是 `ctx.remote.$mount` 挂上来的**独立 Cordis 服务**，不是 `remote` 服务的普通属性；不声明就访问会被 Cordis guard 拒绝：`cannot get property "remote.session" without inject`（面板报 `error:` 且 0 节点时先查这里）。

@@ -39,8 +39,11 @@ around by moving files:
 The host half `lib/index.js` exists so that ① reaches the page: a durable client
 bundle can only `require` react, cordis and the slot/primitive/dockkit modules —
 the Package-private `harness`/`host` bridge is for dynamic packages only. It
-serves `GET /session-manager/state` (same origin, so the page's own credentials
-apply) with the serialized records.
+serves `GET /session-manager/state` with the serialized records. That route is
+**not** credential-gated (unlike the app's own pages), but the server binds
+`127.0.0.1` and the body is exactly the content of
+`<DSH_HOME>/session-manager/state.json` — the same local user could read that
+file anyway, so the route widens no exposure. It is not a secrecy boundary.
 
 ## Notes and pitfalls
 
