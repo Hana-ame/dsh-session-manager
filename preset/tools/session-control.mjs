@@ -73,6 +73,10 @@ const codeOf = (error) => (error !== null && typeof error === 'object' && typeof
 const asString = (value) => (typeof value === 'string' ? value : '');
 const asInt = (value, fallback) => (typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback);
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+/** Clip one display string, marking the elision. */
+const clip = (text, cap) => (text.length > cap ? `${text.slice(0, cap)}…` : text);
+/** Shorten one opaque id to its distinguishing tail. */
+const shortId = (id) => (id.length > 10 ? `…${id.slice(id.length - 8)}` : id);
 
 // ── per-session notes, owned by this plugin ─────────────────────────────────
 
@@ -542,6 +546,79 @@ export default {
       },
     };
 
+    const queueTool = {
+      name: 'session_queue',
+      description: "List the messages currently waiting in one session's inbox, in delivery order, with each message's placement. This is what session_send(mode=\"queue\") parked for after the current turn and what mode=\"steer\" will insert at the next step boundary, so it is how you check whether a prompt you sent is still pending. The inbox belongs to the live agent, so a cold session (no attached agent) has none; session_list shows running state. Read-only: nothing is delivered, admitted or cancelled.",
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable session id, from session_list.' },
+          maxChars: { type: 'integer', description: 'Per-message character cap, 100-2000. Defaults to 400.' },
+        },
+        required: ['sessionId'],
+      },
+      output: OUTPUT,
+      async execute(args) {
+        const controller = requireController();
+        if (controller === null) return fail('sessionController is unavailable in this deployment; session management is not possible here.');
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        if (sessionId.length === 0) return fail('sessionId is required.');
+        if (typeof controller.control !== 'function') {
+          return fail('This deployment exposes no live control stream, so a session inbox cannot be read.');
+        }
+        const maxChars = clamp(asInt(input.maxChars, 400), 100, 2000);
+
+        // The inbox lives on the live control stream: its first frame is a
+        // complete baseline carrying one queue per attached session. Read that
+        // frame, then abort the stream — subscribing must not keep anything alive.
+        const abort = new AbortController();
+        let items = null;
+        let attached = false;
+        try {
+          for await (const frame of controller.control(abort.signal)) {
+            if (frame === null || typeof frame !== 'object' || frame.type !== 'baseline') continue;
+            const value = frame.value;
+            const queues = value !== null && value !== undefined && typeof value === 'object' ? value.queues : undefined;
+            if (queues !== null && queues !== undefined && typeof queues === 'object') {
+              attached = Object.prototype.hasOwnProperty.call(queues, sessionId);
+              items = Array.isArray(queues[sessionId]) ? queues[sessionId] : [];
+            } else {
+              items = [];
+            }
+            // Release the stream BEFORE leaving the loop: a bare `break` waits on
+            // the stream's own cancellation, and that cancellation is this signal.
+            abort.abort();
+            break;
+          }
+        } catch (error) {
+          // A throw after the baseline is the stream closing under us, not a read failure.
+          if (items === null) return fail(`Reading the inbox of ${sessionId} failed: ${messageOf(error)}`);
+        } finally {
+          abort.abort();
+        }
+        if (items === null) return fail('The live control stream ended before sending a baseline, so no inbox could be read. Try again.');
+
+        if (items.length === 0) {
+          return ok(attached
+            ? `Session ${sessionId} has a live inbox with nothing pending.`
+            : `No live inbox is registered for ${sessionId}: it has no attached agent in this process (a cold session), so nothing can be pending. session_list shows its running state; session_send with mode="queue" or "steer" creates pending messages.`);
+        }
+        const lines = [];
+        for (let index = 0; index < items.length; index++) {
+          const item = items[index];
+          const placement = item !== null && typeof item === 'object' && typeof item.placement === 'string' ? item.placement : 'queued';
+          const id = item !== null && typeof item === 'object' && typeof item.id === 'string' ? item.id : '';
+          const message = item !== null && typeof item === 'object' ? item.message : undefined;
+          const content = message !== null && message !== undefined && typeof message === 'object' ? message.content : undefined;
+          const text = textOf(content, false).trim().replace(/\s*\n\s*/g, ' ');
+          const shown = text.length === 0 ? '(no text content)' : clip(text, maxChars);
+          lines.push(`${String(index + 1)}. [${placement}] ${shown}${id.length > 0 ? `  (id ${shortId(id)})` : ''}`);
+        }
+        return ok(`${String(items.length)} pending message${items.length === 1 ? '' : 's'} in ${sessionId}, in delivery order:\n${lines.join('\n')}`);
+      },
+    };
+
     const stopTool = {
       name: 'session_stop',
       description: "Cancel the active turn of another live session, keeping that session's pending inbox so nothing queued is lost. A cold persisted session reports session/not-found; only a live (attached) session can be cancelled. Stopping one fork branch leaves every other branch running.",
@@ -812,6 +889,7 @@ export default {
     ctx.tools.register(listTool);
     ctx.tools.register(readTool);
     ctx.tools.register(sendTool);
+    ctx.tools.register(queueTool);
     ctx.tools.register(stopTool);
     ctx.tools.register(forkTool);
     ctx.tools.register(describeTool);

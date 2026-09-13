@@ -2,7 +2,7 @@
 
 一个 [DSH](https://github.com/deepseek-ai/deepseek-harness)（DeepSeek Harness）agent preset：**这个模式下的会话只用来管理其他会话**。它不写代码、不改文件、不跑命令、不访问网络，只能观察、分叉、标注、指挥本 DSH 进程内的其他会话，并在这些会话与用户之间协调信息。
 
-配套还有一个会话关系画布（Session Canvas）：把进程内所有会话画成节点，按工作目录分组，用连线表示父子/分叉关系。
+配套还有一个会话关系画布（Session Canvas）：把**当前工作区**的会话画成节点，按工作目录分组，用连线表示父子/分叉关系。
 
 ## 目录结构
 
@@ -11,7 +11,7 @@ preset/                              # 可直接使用的 agent preset（拷进 
 ├── agent.cordis.yml                 # Cordis 组合
 ├── preset.yml                       # 显示名与描述
 └── tools/
-    ├── session-control.mjs          # 8 个会话管理工具的持久实现
+    ├── session-control.mjs          # 9 个会话管理工具的持久实现
     └── session-control.test.mjs     # 冒烟测试（假 ctx + 临时 DSH_HOME，不碰真实状态）
 
 plugins/session-canvas/              # 动态 Cordis 包源码（不是 ES module，见下）
@@ -34,6 +34,7 @@ DSH 的 preset 发现每次都会重读 roots，所以**不需要重启**：新�
 | `session_list` | 列出**其他**会话（自己永远排除）：id、工作目录、标题、运行状态、血统（顶层 / 某个会话的分叉 / 子会话），以及本模式给它挂的私有备注。默认只看当前工作目录，`scope:"all"` 看全进程 |
 | `session_read` | **只读**读某个会话最近的事件。`detail:"text"`（默认）只给 user/assistant 对话文本；`detail:"tools"` 再加工具调用、工具结果与失败信息；`detail:"all"` 再加 system/上下文消息、思考文本与标题变更。不唤醒、不写入，冷会话也能读 |
 | `session_send` | 投递一条提示并唤醒目标：`queue`（默认，等它当前轮次结束）/ `steer`（在最近的 step 边界插入） |
+| `session_queue` | **只读**列出某个会话当前排队中的消息：顺序即投递顺序，每条带 `queued` / `steering` 标注，用来确认刚投的那条还在不在队列里。队列属于活着的 agent，冷会话没有队列；不投递、不取消、不放行 |
 | `session_stop` | 取消某活跃会话的当前轮次，保留其已排队消息 |
 | `session_fork` | 在某个**已完成轮次**的边界上把会话分叉成独立副本，返回新的 session id |
 | `session_describe` | 给某个会话挂 / 读 / 清一条**只有本 preset 看得到**的私有备注 |
@@ -98,26 +99,27 @@ DSH 的 preset 发现每次都会重读 roots，所以**不需要重启**：新�
 node preset/tools/session-control.test.mjs
 ```
 
-它用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：备注的写/读/清与落盘、`session_list` 的血统标注 / 备注 / 模型路由展示、`session_read` 三档 detail 的取舍与顺序、模型目录的渲染与失败项、模型**读取**（优先 projection、回退 fold 日志、不触发 resume）、模型**切换**（请求字段完整、半对参数被拒、副作用被披露）、发送/自投递拦截/空文本拦截/取消/分叉与自动命名。全部通过时退出码 0。
+它用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：备注的写/读/清与落盘、`session_list` 的血统标注 / 备注 / 模型路由展示、`session_read` 三档 detail 的取舍与顺序、模型目录的渲染与失败项、模型**读取**（优先 projection、回退 fold 日志、不触发 resume）、模型**切换**（请求字段完整、半对参数被拒、副作用被披露）、发送/自投递拦截/空文本拦截/取消/分叉与自动命名、排队消息的读取（顺序与 `placement`、默认截断与 `maxChars`、活会话空队列、冷会话无队列、读完即释放控制流、只读性）。全部通过时退出码 0。
 
 ## 使用画布
 
-画布是一个**动态 Cordis 包**：源码存在进程内存里，进程重启即消失。要跑起来：
+画布现在是一个**真正的 client 插件包**（`plugins/session-canvas-plugin/`，安装步骤见其中的 `INSTALL.md`）：源码在磁盘上，profile 里占一行 Loader entry，进程重启后依然在。安装就三步——把包放到 `$DSH_HOME/profiles/node_modules/@local/` 下、在 `profiles/web/cordis.patch.yml` 追加一行 `name: '@local/dsh-session-canvas'`、重启。删掉那一行即彻底撤下。
 
-1. 用 `cordis_define`（`kind: "new"`）新建插件，把 `plugins/session-canvas/host.js` 的**全文**作为 `code.host`，`client.js` 的**全文**作为 `code.client`；
-2. 用 `cordis_run` 激活。**含 client 的包需要用户在 UI 里点对勾批准**（纯 host 包不需要）；
-3. 批准后：侧栏底部 Settings 旁多一个三节点图标按钮，点它开关面板；面板默认打开。
+- **为什么必须占一行 entry**：client 模块系统只扫描 host Loader 的 entry，preset 子树里的行不是 entry，所以客户端半无法从 preset 提供。
+- **只画当前工作区**：以 `shell.overlay` 标准 prop `useWorkspaces` 的 Workspace 投影为准，用与侧栏完全相同的推导（`items.find(item => item.sessionIds.includes(current))`）选出当前会话所属工作区；保留「该工作区登记的会话 ∪ cwd 位于工作区路径之下的会话（子会话常起在子目录）∪ 已保留会话的全部后代」。当前会话本身是子会话/分叉时，沿 `parentSessionId` 上溯找它的工作区。**找不到工作区时画 0 个节点**（并在画布上写明原因），不会退回「全部工作区」。
+- 交互：拖拽平移、`−`/`+` 缩放、「适应」重排、点节点看详情（标题、短 id、cwd、running、血统）。
+- 数据来自已有的 `session` Remote 命名空间（`session.list`），每 4 秒刷新一次。
 
-两个文件都**不是 ES module**：整份文件就是传给 `cordis_define` 的函数体，所以它以顶层 `return {` 开头、不 import 任何东西——它在沙箱里求值，`ctx` / `harness` / `React` / `host` / `styles` / `console` 由沙箱提供。
-
-> 与导出时的运行实例（`scanv-7` / `pkg-12`）的唯一差别：本仓库版本正确区分了「分叉」与「子会话」的血统标注，运行实例当时把任何带 `parentSession` 的会话都标成子会话。画布目前还**没有**显示私有备注。
+> 客户端半必须声明 `inject: ['remote', 'remote.session', 'slots']`。`remote.session` 是 `ctx.remote.$mount` 挂上来的**独立 Cordis 服务**，不是 `remote` 服务的普通属性；不声明就访问会被 Cordis guard 拒绝：`cannot get property "remote.session" without inject`（客户端半无法加载或加载后取不到数据时先查这里）。
+>
+> 改完 `lib/client.js` **不必重启**：profile 里的 `client-hmr` 每 500ms 轮询 bundle 的 mtime/size，一变就经 SSE 推给页面热替换；面板几秒内自动变成新版本。
 
 ## 重要边界
 
 - **只看得见本进程**：`sessionController` 是本 DSH 进程内的会话表，别的 dsh 进程/服务上的会话看不到、管不了。
 - **子会话不由本模式驱动**：`origin:"subagent"` 的会话被 ownership fence 拦住，只能由它的活父会话走 subagent 通道；**分叉不受此限制**（fork 不建立运行时父子关系，所以是普通会话）。
 - **`session_send` 等于用户消息**：写进去的就是目标会话日志里的用户消息，目标会真的开始干活。
-- **画布不持久**：要长期可用得把它做成真正的 client 插件包（`dsh.client` 元数据 + 浏览器 bundle），那需要 profile 安装加构建。
+- **画布必须占一行 Loader entry**：客户端半放在 preset 里不会被扫描到，所以它装在 profile 下；包本身是手写 bundle，不需要构建工具链。**画布只显示当前工作区**，进程内其他工作区的会话不在图上（这是刻意的，不是 bug）。
 - **备注不随会话删除**：备注表按 session id 存；会话被删或归档后条目仍在（不清理，避免误删仍在用的备注）。
 
 ## 出处

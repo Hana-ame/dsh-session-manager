@@ -20,3 +20,16 @@ dsh --profile web --dump-config | grep -A1 session-canvas
 ```
 
 Removing the row from `cordis.patch.yml` withdraws the canvas completely.
+
+## Notes
+
+- The client half declares `inject: ['remote', 'remote.session', 'slots']`. `remote.session` is not a
+  property of the `remote` service: it is a **Remote namespace mounted as its own Cordis service** by
+  `ctx.remote.$mount(...)`. Reading it without declaring the injection is rejected by the Cordis guard
+  (`cannot get property "remote.session" without inject`) and the canvas renders `error:` with 0 nodes.
+- Editing `lib/client.js` needs **no restart**: the profile's `client-hmr` polls each bundle's
+  mtime/size every 500 ms and pushes a hot swap over SSE, so an open page picks the new code up in
+  seconds. Changing `package.json` (the `dsh.client` metadata) or adding/removing the row does need a
+  restart, because that is what the composition scan reads.
+- The canvas is scoped to the **current Workspace** and deliberately draws nothing when the current
+  session belongs to none.

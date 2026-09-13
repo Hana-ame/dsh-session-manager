@@ -22,6 +22,8 @@ const notePath = join(dshHome, 'session-manager', 'descriptions.json')
 
 const captured = {}
 const calls = []
+/** Every signal a tool handed to the live control stream, so cancellation is observable. */
+const controlSignals = []
 
 const events = [
   { type: 'user/message', seq: 1, time: 1000, data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'hello there' }], source: { kind: 'user' } } },
@@ -44,6 +46,27 @@ const controller = {
   inspect: async () => ({ meta: { id: 'session-a', cwd: '/tmp/repo' }, inheritedEventCount: 0, events }),
   prompt: async (request) => { calls.push(['prompt', request.sessionId, request.mode, request.content[0].text]); return { accepted: true } },
   cancel: async (request) => { calls.push(['cancel', request.sessionId]); return { accepted: true } },
+  control: (signal) => {
+    controlSignals.push(signal)
+    return (async function* () {
+      calls.push(['control'])
+      yield { type: 'baseline', value: { queues: {
+        'session-a': [
+          { id: 'msg-queued-01', placement: 'queued', message: { id: 'msg-queued-01', content: [{ type: 'text', text: 'run the tests after this turn' }] } },
+          { id: 'msg-steering-02', placement: 'steering', message: { id: 'msg-steering-02', content: [{ type: 'text', text: 'stop and report' }] } },
+          { id: 'msg-long-03', placement: 'queued', message: { id: 'msg-long-03', content: [{ type: 'text', text: 'x'.repeat(600) }] } },
+        ],
+        'session-live-empty': [],
+      }, jobs: {}, projections: {} } }
+      // A real control stream stays open until its caller aborts; the tool must
+      // take the baseline and release the stream rather than wait for more frames.
+      await new Promise((resolve) => {
+        if (signal.aborted) resolve()
+        else signal.addEventListener('abort', resolve, { once: true })
+      })
+      calls.push(['control-released'])
+    })()
+  },
   fork: async (request) => { calls.push(['fork', request.sessionId, String(request.atSeq)]); return { sessionId: 'session-forked' } },
   rename: async (request) => { calls.push(['rename', request.sessionId, request.title]); return { title: request.title, seq: 99 } },
   modelCatalog: async () => ({
@@ -79,8 +102,8 @@ const check = (label, condition, detail) => {
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-check('eight tools registered', same(Object.keys(captured).sort(), [
-  'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_read', 'session_send', 'session_stop',
+check('nine tools registered', same(Object.keys(captured).sort(), [
+  'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
 ]), Object.keys(captured).join(','))
 
 // session_list
@@ -157,6 +180,25 @@ check('fork returns child', (await captured.session_fork.execute({ sessionId: 's
 check('fork auto-titles "<title> · fork"', calls.some((c) => c[0] === 'rename' && c[1] === 'session-forked' && c[2] === 'Alpha · fork'))
 await captured.session_fork.execute({ sessionId: 'session-a', atSeq: 42, title: 'branch B' }, callerExec)
 check('fork passes atSeq and title', calls.some((c) => c[0] === 'fork' && c[2] === '42') && calls.some((c) => c[1] === 'session-forked' && c[2] === 'branch B'))
+
+// session_queue
+const mutationsBefore = calls.filter((c) => c[0] === 'prompt' || c[0] === 'cancel').length
+const queue = await captured.session_queue.execute({ sessionId: 'session-a' }, callerExec)
+check('queue lists pending messages in delivery order', queue.ok === true
+  && queue.text.indexOf('run the tests after this turn') < queue.text.indexOf('stop and report'), queue.text)
+check('queue shows placement per message',
+  queue.text.includes('[queued]') && queue.text.includes('[steering]'), queue.text)
+check('queue reports the count and the session', queue.text.includes('3 pending messages in session-a'), queue.text)
+check('queue clips long text by default', queue.text.includes('…') && !queue.text.includes('x'.repeat(500)), queue.text.slice(0, 200))
+check('queue honours maxChars', (await captured.session_queue.execute({ sessionId: 'session-a', maxChars: 100 }, callerExec)).text.split('\n')[3].length < 160)
+check('queue handles an attached session with nothing pending',
+  (await captured.session_queue.execute({ sessionId: 'session-live-empty' }, callerExec)).text.includes('nothing pending'))
+check('queue explains a session with no live inbox',
+  (await captured.session_queue.execute({ sessionId: 'session-b' }, callerExec)).text.includes('No live inbox is registered'))
+check('queue requires a sessionId', (await captured.session_queue.execute({}, callerExec)).ok === false)
+check('queue releases the live stream it borrowed',
+  controlSignals.length >= 1 && controlSignals.every((signal) => signal.aborted === true), JSON.stringify(controlSignals.map((s) => s.aborted)))
+check('queue is read-only', calls.filter((c) => c[0] === 'prompt' || c[0] === 'cancel').length === mutationsBefore, JSON.stringify(calls))
 
 const failures = results.filter((row) => row[0] === 'FAIL')
 for (const [status, label, detail] of results) console.log(`${status}  ${label}${detail}`)

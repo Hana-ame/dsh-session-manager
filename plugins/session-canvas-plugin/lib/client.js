@@ -161,7 +161,80 @@ window.__ModuleLoader__.load({
 			return 'top-level';
 		};
 
-		const drawScene = (canvas, layout, view, selectedId, currentId) => {
+		/** Whether `cwd` names `root` itself or a directory strictly below it. */
+		const trimTail = (path) => (path.length > 1 && path.endsWith('/') ? path.replace(/\/+$/, '') || '/' : path);
+		const underRoot = (cwd, root) => {
+			if (typeof cwd !== 'string' || cwd.length === 0) return false;
+			if (typeof root !== 'string' || root.length === 0) return false;
+			const left = trimTail(cwd);
+			const right = trimTail(root);
+			if (left === right) return true;
+			return left.startsWith(right === '/' ? '/' : right + '/');
+		};
+
+		/**
+		* The Workspace row accounting for `sessionId`, exactly as the shipped
+		* sidebar derives it (`workspace.items.find(item => item.sessionIds
+		* .includes(current))`), extended to walk up fork/subagent ancestors so the
+		* canvas also scopes correctly while a child session is the open one.
+		*/
+		const workspaceOf = (items, sessionId, sessions) => {
+			if (!Array.isArray(items) || typeof sessionId !== 'string' || sessionId.length === 0) return null;
+			const byId = new Map();
+			if (Array.isArray(sessions)) for (const session of sessions) byId.set(session.id, session);
+			const seen = new Set();
+			let cursor = sessionId;
+			for (let hop = 0; hop < 12; hop++) {
+				if (typeof cursor !== 'string' || cursor.length === 0 || seen.has(cursor)) return null;
+				seen.add(cursor);
+				for (const item of items) {
+					if (item !== null && typeof item === 'object' && Array.isArray(item.sessionIds) && item.sessionIds.indexOf(cursor) !== -1) return item;
+				}
+				const summary = byId.get(cursor);
+				cursor = summary !== undefined && typeof summary.parentId === 'string' ? summary.parentId : null;
+			}
+			return null;
+		};
+
+		/**
+		* Restrict the canonical session list to one Workspace: sessions the
+		* Workspace accounts for, sessions whose `cwd` sits under its path (which is
+		* how a subagent started in a subdirectory stays attached), and every
+		* descendant of an already kept session.
+		*/
+		const scopeToWorkspace = (sessions, workspace, currentId) => {
+			const byId = new Map();
+			for (const session of sessions) byId.set(session.id, session);
+			const accounted = new Set();
+			let root = null;
+			if (workspace !== null && workspace !== undefined && typeof workspace === 'object') {
+				if (Array.isArray(workspace.sessionIds)) for (const id of workspace.sessionIds) accounted.add(String(id));
+				if (typeof workspace.path === 'string' && workspace.path.length > 0) root = workspace.path;
+			}
+			if (root === null && typeof currentId === 'string' && byId.has(currentId)) {
+				const anchor = byId.get(currentId);
+				if (typeof anchor.cwd === 'string' && anchor.cwd.length > 0) root = anchor.cwd;
+			}
+			if (accounted.size === 0 && root === null) return [];
+			const keep = new Set();
+			for (const session of sessions) {
+				if (accounted.has(session.id) || underRoot(session.cwd, root)) keep.add(session.id);
+			}
+			let grew = true;
+			while (grew) {
+				grew = false;
+				for (const session of sessions) {
+					if (keep.has(session.id)) continue;
+					if (typeof session.parentId === 'string' && keep.has(session.parentId)) {
+						keep.add(session.id);
+						grew = true;
+					}
+				}
+			}
+			return sessions.filter((session) => keep.has(session.id));
+		};
+
+		const drawScene = (canvas, layout, view, selectedId, currentId, emptyText) => {
 			if (canvas === null || canvas === undefined || typeof canvas.getContext !== 'function') return;
 			const context = canvas.getContext('2d');
 			if (context === null || context === undefined) return;
@@ -175,7 +248,7 @@ window.__ModuleLoader__.load({
 			if (layout === null || layout.nodes.length === 0) {
 				context.font = '500 13px ' + FONT;
 				context.fillStyle = '#5d6577';
-				context.fillText(layout === null ? 'loading sessions…' : 'no sessions to draw', 40, 56);
+				context.fillText(layout === null ? 'loading sessions…' : (typeof emptyText === 'string' && emptyText.length > 0 ? emptyText : 'no sessions to draw'), 40, 56);
 				return;
 			}
 
@@ -293,7 +366,7 @@ window.__ModuleLoader__.load({
 		const mutedStyle = { color: '#79829a' };
 
 		/** Build every component and register both slots. Runs once the client `slots` service exists. */
-		const install = (ctx) => {
+		const install = (ctx, sessionApi) => {
 			let openState = true;
 			const openListeners = new Set();
 			const setOpen = (next) => {
@@ -315,8 +388,7 @@ window.__ModuleLoader__.load({
 
 			/** One `session.list` round trip through the existing Remote namespace. */
 			const fetchSessions = async () => {
-				const remote = ctx.get('remote');
-				const namespace = remote !== null && remote !== undefined ? remote.session : undefined;
+				const namespace = sessionApi;
 				if (namespace === null || namespace === undefined || typeof namespace.list !== 'function') {
 					throw new Error('the session Remote namespace is unavailable');
 				}
@@ -333,6 +405,12 @@ window.__ModuleLoader__.load({
 
 			function SessionCanvas(props) {
 				const currentId = useCurrentId(props.useSessions);
+				// Standard prop of the `shell.overlay` seat: the Workspace projection.
+				// `items` is a stable array reference, so the selector snapshot stays
+				// comparable; the matching row is then resolved by session membership.
+				const workspaceItems = typeof props.useWorkspaces === 'function'
+					? props.useWorkspaces((state) => (state !== null && state !== undefined && Array.isArray(state.items) ? state.items : null))
+					: null;
 				const dataPair = React.useState(null);
 				const data = dataPair[0];
 				const setData = dataPair[1];
@@ -348,9 +426,6 @@ window.__ModuleLoader__.load({
 				const dragPair = React.useState(null);
 				const drag = dragPair[0];
 				const setDrag = dragPair[1];
-				const scopePair = React.useState('all');
-				const scope = scopePair[0];
-				const setScope = scopePair[1];
 				const holderPair = React.useState(() => ({ el: null }));
 				const holder = holderPair[0];
 				const viewKeyHolder = React.useState(() => ({ key: null }))[0];
@@ -370,20 +445,27 @@ window.__ModuleLoader__.load({
 					return () => { clearInterval(handle); };
 				}, []);
 
-				let visible = data === null ? [] : data;
-				if (scope === 'workspace' && data !== null) {
-					let anchor = null;
-					for (const session of data) if (session.id === currentId && typeof session.cwd === 'string') anchor = session.cwd;
-					if (anchor !== null) visible = data.filter((session) => session.cwd === anchor);
-				}
+				// The canvas is workspace-scoped: only the Workspace that accounts for
+				// the current Session is drawn, so one process serving several projects
+				// never mixes their graphs.
+				const workspace = workspaceOf(workspaceItems, currentId, data);
+				const visible = data === null ? [] : scopeToWorkspace(data, workspace, currentId);
 				const layout = data === null ? null : buildLayout(visible);
-				const nextViewKey = (data === null ? 0 : data.length) + ':' + scope;
+				const workspaceLabel = workspace === null
+					? '（未识别）'
+					: (typeof workspace.title === 'string' && workspace.title.length > 0
+						? workspace.title
+						: (typeof workspace.path === 'string' && workspace.path.length > 0 ? workspace.path : '（未命名）'));
+				const emptyLabel = workspace === null
+					? '无法确定当前工作区：没有当前会话，或该会话未归入任何工作区'
+					: '当前工作区没有可绘制的会话';
+				const nextViewKey = (data === null ? 0 : visible.length) + ':' + String(currentId);
 				React.useEffect(() => {
 					if (viewKeyHolder.key === nextViewKey) return;
 					viewKeyHolder.key = nextViewKey;
 					setView(fitView(layout));
 				}, [nextViewKey]);
-				React.useEffect(() => { drawScene(holder.el, layout, view, selectedId, currentId); });
+				React.useEffect(() => { drawScene(holder.el, layout, view, selectedId, currentId, emptyLabel); });
 
 				const zoomBy = (factor) => {
 					const nextScale = Math.max(0.32, Math.min(2.4, view.scale * factor));
@@ -421,15 +503,14 @@ window.__ModuleLoader__.load({
 					React.createElement('div', null,
 						React.createElement('div', { style: { fontSize: '14px', fontWeight: 600, color: '#e7ebf3' } }, 'Session Canvas'),
 						React.createElement('div', { style: { fontSize: '11.5px', color: '#7e879c', marginTop: '3px' } },
-							'本进程内的会话关系图 · ' + status + ' · nodes ' + String(data === null ? 0 : data.length) + ' / shown ' + String(visible.length))
+							'当前工作区 ' + workspaceLabel + ' · ' + status + ' · 会话 ' + String(visible.length))
 					),
 					React.createElement('button', { type: 'button', 'aria-label': '关闭', title: '关闭', onClick: () => setOpen(false), style: closeStyle }, '✕')
 				);
 
 				const toolbar = React.createElement('div', { style: toolbarStyle },
 					React.createElement('button', { type: 'button', style: buttonStyle(false), onClick: refresh }, '刷新'),
-					React.createElement('button', { type: 'button', style: buttonStyle(scope === 'all'), onClick: () => setScope('all') }, '全部工作区'),
-					React.createElement('button', { type: 'button', style: buttonStyle(scope === 'workspace'), onClick: () => setScope('workspace') }, '仅当前工作区'),
+					React.createElement('span', { style: { fontSize: '11.5px', color: '#7e879c' } }, '仅当前工作区'),
 					React.createElement('span', { style: { flex: '1' } }),
 					React.createElement('button', { type: 'button', style: buttonStyle(false), onClick: () => zoomBy(0.85) }, '−'),
 					React.createElement('button', { type: 'button', style: buttonStyle(false), onClick: () => zoomBy(1.18) }, '+'),
@@ -499,13 +580,20 @@ window.__ModuleLoader__.load({
 		};
 
 		const apply = (ctx) => {
-			// `inject` on the plugin is not used on purpose: `ctx.inject` runs the
-			// installer the moment the client `slots` service exists, and a package
-			// parked on a wrong service name would fail silently instead.
-			ctx.inject(['slots'], (scoped) => { install(scoped); });
+			// `remote.session` is a Remote namespace MOUNTED as its own Cordis service
+			// (see `ctx.remote.$mount`), not an ordinary property of the `remote`
+			// service. Reading it without declaring it is rejected by the Cordis
+			// guard: cannot get property "remote.session" without inject. So the
+			// namespace is resolved here, where the declared injection is in scope.
+			const sessionApi = ctx.remote.session;
+			ctx.inject(['slots'], (scoped) => { install(scoped, sessionApi); });
 		};
 
 		exports.apply = apply;
+		// Hard dependencies of this client half: the Remote service, the session
+		// namespace mounted onto it, and the Slot registry. Cordis parks the plugin
+		// until each one exists, so `ctx.remote.session` above cannot read undefined.
+		exports.inject = ['remote', 'remote.session', 'slots'];
 		return module.exports;
 	},
 });
