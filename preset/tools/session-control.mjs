@@ -7,12 +7,13 @@
  * preset and needs no package install. A bare package name would instead
  * resolve from the harness install, which this directory cannot reach.
  *
- * Why it is `.mjs` and imports nothing:
- * the preset directory carries no package.json declaring `"type": "module"`,
- * so a `.js` file would be loaded as CommonJS. And only the ROW's specifier is
- * rewritten by the loader — a bare `import '@deepseek-ai/dsh-*'` inside this
- * file would be resolved by Node from THIS directory, not from the harness.
- * So it uses plain object tool definitions and no imports at all.
+ * Why it is `.mjs`:
+ * the preset directory carries no package.json declaring `"type": "module"`, so
+ * a `.js` file would be loaded as CommonJS. A bare `import '@deepseek-ai/dsh-*'`
+ * inside this file would be resolved by Node from THIS directory, not from the
+ * harness — so this file imports NO packages. `node:*` builtins are the one
+ * exception: they resolve as builtins anywhere, so reading and writing the
+ * private note file below needs no dependency at all.
  *
  * Plane: these tools consume the host-plane `sessionController` / `agents`
  * services and publish none of their own, so the composition row sits loose —
@@ -23,7 +24,18 @@
  * fork records only `parentSession` (`isSeeded`). So `parentSession` alone does
  * NOT mean "owned by another session" — a fork keeps a durable parent but is
  * NOT subagent-owned at runtime, which is exactly why it stays manageable here.
+ *
+ * Per-session notes (`session_describe`): kept in THIS plugin's own JSON file at
+ * `<DSH_HOME>/session-manager/descriptions.json`. A note is deliberately not a
+ * session title: it is never appended to any session log, so the session list,
+ * the sidebar, the trajectory view and every other consumer of that session
+ * never see it. Only this preset's tools read it. It is not a secrecy boundary —
+ * the file sits in the DSH home and any process could open it — it is a
+ * provenance boundary: nothing else writes or reads it.
  */
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 let requestSeq = 0;
 
@@ -62,6 +74,72 @@ const asString = (value) => (typeof value === 'string' ? value : '');
 const asInt = (value, fallback) => (typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback);
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 
+// ── per-session notes, owned by this plugin ─────────────────────────────────
+
+const NOTE_FILE_VERSION = 1;
+const NOTE_MAX_CHARS = 200;
+
+/** `<DSH_HOME>/session-manager/descriptions.json`, resolving DSH_HOME the way the harness does. */
+const notePath = () => {
+  const configured = process.env.DSH_HOME;
+  const home = typeof configured === 'string' && configured.trim().length > 0 ? configured.trim() : join(homedir(), '.dsh');
+  return join(home, 'session-manager', 'descriptions.json');
+};
+
+let noteCache = null;
+let noteChain = Promise.resolve();
+
+/** Load the note table once; a missing or corrupt file simply means "no notes". */
+const loadNotes = async () => {
+  if (noteCache !== null) return noteCache;
+  try {
+    const parsed = JSON.parse(await readFile(notePath(), 'utf8'));
+    const byId = parsed !== null && typeof parsed === 'object' && parsed.byId !== null && typeof parsed.byId === 'object' ? parsed.byId : {};
+    noteCache = { byId };
+  } catch (error) {
+    noteCache = { byId: {} };
+  }
+  return noteCache;
+};
+
+const saveNotes = async (state) => {
+  const path = notePath();
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({ version: NOTE_FILE_VERSION, byId: state.byId }, null, 2)}\n`, 'utf8');
+};
+
+/** Serialize mutations so two concurrent tool calls cannot interleave a read-modify-write. */
+const withNotes = (operation) => {
+  const run = noteChain.then(operation);
+  noteChain = run.then(() => undefined, () => undefined);
+  return run;
+};
+
+/** The current note for one session, or null. */
+const noteOf = async (sessionId) => {
+  const state = await loadNotes();
+  const entry = state.byId[sessionId];
+  return entry !== null && entry !== undefined && typeof entry.description === 'string' ? entry.description : null;
+};
+
+/** Set (non-empty) or clear (empty string) one session's note, rolling the cache back on a failed write. */
+const writeNote = (sessionId, description) => withNotes(async () => {
+  const state = await loadNotes();
+  const previous = state.byId[sessionId];
+  if (description.length === 0) delete state.byId[sessionId];
+  else state.byId[sessionId] = { description, updatedAt: Date.now() };
+  try {
+    await saveNotes(state);
+  } catch (error) {
+    if (previous === undefined) delete state.byId[sessionId];
+    else state.byId[sessionId] = previous;
+    throw error;
+  }
+  return description.length === 0 ? null : description;
+});
+
+// ── transcript readers ──────────────────────────────────────────────────────
+
 /** Read one session's current title projection, or null when unset. */
 const titleOf = async (controller, sessionId) => {
   try {
@@ -81,16 +159,29 @@ const titleOf = async (controller, sessionId) => {
 };
 
 /** Collect the readable text of one content-block list, eliding the noisy kinds. */
-const textOf = (blocks) => {
+const textOf = (blocks, includeReasoning) => {
   if (!Array.isArray(blocks)) return '';
   let out = '';
   for (const block of blocks) {
     if (block === null || typeof block !== 'object') continue;
     if (block.type === 'text' && typeof block.text === 'string') out += block.text;
+    else if (block.type === 'reasoning' && includeReasoning === true && typeof block.text === 'string') out += `\n[reasoning] ${block.text}`;
     else if (block.type === 'image') out += '[image]';
     else if (block.type === 'file') out += '[file]';
     else if (block.type === 'tool-call') out += `[tool ${String(block.name)}]`;
     else if (block.type === 'tool-result') out += '[tool result]';
+  }
+  return out;
+};
+
+/** Unwrap a tool-result message: its payload lives inside tool-result blocks. */
+const textOfToolResult = (message) => {
+  if (message === null || message === undefined || typeof message !== 'object' || !Array.isArray(message.content)) return '';
+  let out = '';
+  for (const block of message.content) {
+    if (block === null || typeof block !== 'object') continue;
+    if (block.type === 'tool-result' && Array.isArray(block.content)) out += textOf(block.content, false);
+    else if (block.type === 'text' && typeof block.text === 'string') out += block.text;
   }
   return out;
 };
@@ -133,7 +224,7 @@ export default {
 
     const listTool = {
       name: 'session_list',
-      description: "List the sessions this DSH process knows about — live and persisted — with id, working directory, title, running state, and lineage (top-level, fork of another session, or a subagent child). Caller itself is always excluded. Defaults to the caller's own working directory; scope \"all\" lists every session in the process. Use this first to pick a sessionId for session_read, session_send, session_stop, or session_fork.",
+      description: "List the sessions this DSH process knows about — live and persisted — with id, working directory, title, running state, lineage (top-level, fork of another session, or a subagent child) and any private note this preset attached. Caller itself is always excluded. Defaults to the caller's own working directory; scope \"all\" lists every session in the process. Use this first to pick a sessionId for session_read, session_send, session_stop, session_fork or session_describe.",
       parameters: {
         type: 'object',
         properties: {
@@ -152,6 +243,9 @@ export default {
         const explicitCwd = asString(input.cwd);
         const caller = callerOf(exec);
         const targetCwd = explicitCwd.length > 0 ? explicitCwd : caller.cwd;
+        if (scope === 'workspace' && targetCwd === null) {
+          return fail('The caller has no working directory to scope to, so a workspace listing would be silently empty. Pass an absolute `cwd`, or call again with scope="all".');
+        }
         const runningOnly = input.runningOnly === true;
         const limit = clamp(asInt(input.limit, 40), 1, 200);
 
@@ -162,6 +256,7 @@ export default {
           return fail(`Could not list sessions: ${messageOf(error)}`);
         }
         const items = listed !== null && listed !== undefined && Array.isArray(listed.items) ? listed.items : [];
+        const notes = (await loadNotes()).byId;
 
         const rows = [];
         for (const item of items) {
@@ -187,6 +282,7 @@ export default {
               updatedAt = null;
             }
           }
+          const entry = notes[id];
           rows.push({
             id,
             cwd,
@@ -196,6 +292,7 @@ export default {
             isFork: !isSubagent && parentId !== null,
             parentId,
             updatedAt,
+            note: entry !== null && entry !== undefined && typeof entry.description === 'string' ? entry.description : null,
           });
           if (rows.length >= limit) break;
         }
@@ -215,10 +312,11 @@ export default {
               + ` | ${lineage}`
               + ` | ${row.title === null ? '(untitled)' : row.title}`
               + ` | updated ${row.updatedAt === null ? 'unknown' : row.updatedAt}`
-              + ` | cwd ${row.cwd === null ? '(none)' : row.cwd}`,
+              + ` | cwd ${row.cwd === null ? '(none)' : row.cwd}`
+              + (row.note === null ? '' : `\n    note: ${row.note}`),
             );
           }
-          lines.push('session_read shows what one of them has been doing; session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
+          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_describe attaches a private note only this preset can see. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
         }
         return ok(lines.join('\n'));
       },
@@ -226,13 +324,14 @@ export default {
 
     const readTool = {
       name: 'session_read',
-      description: 'Read the most recent conversational messages (user, assistant) of one session, newest last, with tool calls and reasoning elided. Use it to learn what another session — or one branch of a fork — has been doing before relaying or steering it. Reading never wakes the session and never writes to it.',
+      description: 'Read the most recent events of one session, oldest first, newest last. detail="text" (default) returns user and assistant prose only; detail="tools" adds tool calls and their results; detail="all" also adds system/context messages, reasoning text and title changes. Reading never wakes the session, never writes to it, and works on cold persisted sessions as well as live ones.',
       parameters: {
         type: 'object',
         properties: {
           sessionId: { type: 'string', description: 'Durable session id, from session_list.' },
-          limit: { type: 'integer', description: 'How many of the newest messages to return, 1-30. Defaults to 8.' },
-          maxChars: { type: 'integer', description: 'Per-message character cap, 200-4000. Defaults to 1200.' },
+          detail: { type: 'string', enum: ['text', 'tools', 'all'], description: '"text" (default) = prose only; "tools" = also tool calls, results and errors; "all" = also system messages, reasoning and titles.' },
+          limit: { type: 'integer', description: 'How many of the newest events to return, 1-40. Defaults to 8 (with detail="tools"/"all" one tool call and its result count separately).' },
+          maxChars: { type: 'integer', description: 'Per-event character cap, 200-4000. Defaults to 1200.' },
         },
         required: ['sessionId'],
       },
@@ -243,7 +342,10 @@ export default {
         const input = args !== null && typeof args === 'object' ? args : {};
         const sessionId = asString(input.sessionId).trim();
         if (sessionId.length === 0) return fail('sessionId is required.');
-        const limit = clamp(asInt(input.limit, 8), 1, 30);
+        const detail = input.detail === 'all' ? 'all' : (input.detail === 'tools' ? 'tools' : 'text');
+        const withTools = detail === 'tools' || detail === 'all';
+        const withAll = detail === 'all';
+        const limit = clamp(asInt(input.limit, 8), 1, 40);
         const maxChars = clamp(asInt(input.maxChars, 1200), 200, 4000);
 
         let inspection;
@@ -261,36 +363,65 @@ export default {
           const event = events[index];
           if (event === null || typeof event !== 'object') continue;
           let role = null;
-          let blocks;
+          let text = '';
           if (event.type === 'user/message') {
             const data = event.data;
             if (data !== null && typeof data === 'object' && data.source !== null && typeof data.source === 'object' && data.source.kind === 'user') {
               role = 'user';
-              blocks = data.content;
+              text = textOf(data.content, false);
             }
           } else if (event.type === 'assistant/message') {
             const data = event.data;
             const message = data !== null && typeof data === 'object' ? data.message : undefined;
             role = 'assistant';
-            blocks = message !== null && message !== undefined ? message.content : undefined;
+            text = textOf(message !== null && message !== undefined ? message.content : undefined, withAll);
+          } else if (withTools && event.type === 'tool/call') {
+            const data = event.data;
+            if (data !== null && typeof data === 'object' && typeof data.name === 'string') {
+              const raw = typeof data.arguments === 'string' ? data.arguments : '';
+              role = 'tool-call';
+              text = `${data.name}(${raw.length > 400 ? `${raw.slice(0, 400)}…` : raw})`;
+            }
+          } else if (withTools && event.type === 'tool/result') {
+            const data = event.data;
+            const message = data !== null && typeof data === 'object' ? data.message : undefined;
+            const error = data !== null && typeof data === 'object' ? data.error : undefined;
+            role = 'tool-result';
+            text = textOfToolResult(message);
+            if (error !== null && error !== undefined && typeof error === 'object') {
+              const name = typeof error.name === 'string' ? error.name : 'error';
+              const code = typeof error.code === 'string' && error.code.length > 0 ? `: ${error.code}` : '';
+              text = `${text}\n[failed ${name}${code}]`;
+            }
+          } else if (withAll && event.type === 'system/message') {
+            const data = event.data;
+            const message = data !== null && typeof data === 'object' ? data.message : undefined;
+            role = 'system';
+            text = textOf(message !== null && message !== undefined ? message.content : undefined, false);
+          } else if (withAll && event.type === 'session/title') {
+            const data = event.data;
+            if (data !== null && typeof data === 'object' && typeof data.title === 'string') {
+              role = 'title';
+              text = data.title;
+            }
           }
           if (role === null) continue;
-          const text = textOf(blocks).trim();
-          if (text.length === 0) continue;
-          const clipped = text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+          const clean = text.trim();
+          if (clean.length === 0) continue;
+          const clipped = clean.length > maxChars ? `${clean.slice(0, maxChars)}…` : clean;
           total += clipped.length;
           let time = 0;
           if (typeof event.time === 'number' && Number.isFinite(event.time)) time = event.time;
           picked.push({ role, time, text: clipped });
-          if (total >= 9000) break;
+          if (total >= 12000) break;
         }
         picked.reverse();
 
         const meta = inspection !== null && inspection !== undefined ? inspection.meta : undefined;
         const cwd = meta !== null && meta !== undefined && typeof meta.cwd === 'string' ? meta.cwd : '(unknown)';
-        const header = `session ${sessionId} | cwd ${cwd} | ${events.length} event(s) | showing the last ${picked.length} conversational message(s)`;
+        const header = `session ${sessionId} | cwd ${cwd} | ${events.length} event(s) | detail=${detail} | showing the last ${picked.length} matching event(s)`;
         if (picked.length === 0) {
-          return ok(`${header}\n\n(no user or assistant text found — the session may be blank or hold only tool traffic)`);
+          return ok(`${header}\n\n(nothing matched — the session may be blank, or hold only events this detail level filters out)`);
         }
         const body = picked
           .map((item) => `[${item.role} ${new Date(item.time).toISOString()}]\n${item.text}`)
@@ -432,10 +563,61 @@ export default {
       },
     };
 
+    const describeTool = {
+      name: 'session_describe',
+      description: "Attach, change, or read a private note for one session — one short line saying what that session is FOR, or what you are waiting on from it. The note is NOT the session title: this preset stores it in its own file and never appends it to any session log, so the session list, the sidebar, the trajectory view and every other agent never see it. It is shown by this preset's session_list and, when the Session Canvas plugin is running, under the node on the canvas. Omit `description` to read the current note; pass an empty string to clear it.",
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable target session id, from session_list.' },
+          description: { type: 'string', description: `New note text, truncated to ${NOTE_MAX_CHARS} characters. An empty string clears the note. Omit the field entirely to read the current note.` },
+        },
+        required: ['sessionId'],
+      },
+      output: OUTPUT,
+      async execute(args) {
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        if (sessionId.length === 0) return fail('sessionId is required.');
+
+        if (typeof input.description !== 'string') {
+          try {
+            const current = await noteOf(sessionId);
+            return ok(current === null ? `${sessionId} has no note.` : `${sessionId} note: ${current}`);
+          } catch (error) {
+            return fail(`Reading the note failed: ${messageOf(error)}`);
+          }
+        }
+
+        const description = input.description.trim().slice(0, NOTE_MAX_CHARS);
+        const controller = requireController();
+        let unknown = '';
+        if (controller !== null) {
+          try {
+            const listed = await controller.list({}, undefined);
+            const items = listed !== null && listed !== undefined && Array.isArray(listed.items) ? listed.items : [];
+            const known = items.some((item) => item !== null && typeof item === 'object' && item.sessionId === sessionId);
+            if (!known) unknown = ` Warning: no session in this process currently has the id ${sessionId}; the note was stored anyway.`;
+          } catch (error) {
+            unknown = '';
+          }
+        }
+        try {
+          const stored = await writeNote(sessionId, description);
+          return ok(stored === null
+            ? `Cleared the note for ${sessionId}.${unknown}`
+            : `Note for ${sessionId} set to: ${stored}${unknown}`);
+        } catch (error) {
+          return fail(`Writing the note failed: ${messageOf(error)}`);
+        }
+      },
+    };
+
     ctx.tools.register(listTool);
     ctx.tools.register(readTool);
     ctx.tools.register(sendTool);
     ctx.tools.register(stopTool);
     ctx.tools.register(forkTool);
+    ctx.tools.register(describeTool);
   },
 };
