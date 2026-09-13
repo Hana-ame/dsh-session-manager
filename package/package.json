@@ -1,20 +1,12 @@
 {
   "name": "@local/dsh-session-manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Session manager: one package holding the durable per-session store (relations + describe notes), the management tools that read and write it, and the canvas that visualizes it.",
+  "description": "Session manager: one package holding the durable per-session store (relations + describe notes) and the management tools that read and write it.",
   "type": "module",
-  "main": "lib/index.js",
   "exports": {
-    ".": "./lib/index.js",
-    "./client": "./lib/client.js",
     "./tools": "./lib/tools.mjs",
     "./store": "./lib/store.mjs",
     "./package.json": "./package.json"
-  },
-  "dsh": {
-    "client": {
-      "platform": "web"
-    }
   }
 }

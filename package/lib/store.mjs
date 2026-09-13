@@ -11,7 +11,7 @@
 //
 // Keeping the lineage here is what makes the relations outlive their sources:
 // a fork whose parent session has since been archived still shows its edge, and
-// the canvas renders exactly the records the tools write.
+// `session_list` reads exactly the records the other tools write.
 //
 // The same file also holds the **delegation ledger**: one record per
 // `session_send(..., callback: true)`, with its target, the task excerpt and the

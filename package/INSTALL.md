@@ -7,15 +7,14 @@
 That writes two destinations that both read **one** package copy:
 
 ```
-$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/   # the package (all three layers)
+$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/   # the package (both layers)
 $DSH_HOME/.agent-presets/session-manager/                     # the preset that mounts ②
-$DSH_HOME/profiles/web/cordis.patch.yml                       # the row that gets ③ served
 ```
 
 ## Why two destinations for one package
 
-Both are forced by how the harness resolves things, and neither can be worked
-around by moving files:
+The placement is forced by how the harness resolves a preset row, and it cannot
+be worked around by moving files:
 
 - **The preset mounts the tools by a relative path into the package.**
   `@deepseek-ai/dsh-agent-presets` resolves a row whose specifier starts with
@@ -24,46 +23,50 @@ around by moving files:
   is therefore the one specifier form that reaches an installed package without
   copying the tools next to the preset. Verified by composing the preset for
   real (`ctx.agentPresets.standingKeyFor('session-manager')`).
-- **The canvas needs a host Loader entry.** The client module system scans the
-  host composition's entries for packages declaring `dsh.client`; a preset
-  subtree is never scanned, so a client half cannot live in the preset.
 
 ## Layers
 
 | Layer | File | Mounted by | Reads/writes |
 | --- | --- | --- | --- |
-| ① persistence | `lib/store.mjs` | imported by ② and the host half | `<DSH_HOME>/session-manager/state.json` |
+| ① persistence | `lib/store.mjs` | imported by ② | `<DSH_HOME>/session-manager/state.json` |
 | ② tools | `lib/tools.mjs` | the preset row (`tool-session-control`) | the store, `sessionController`, `agents`, `commands`, `workspaceRegistry` |
-| ③ canvas | `lib/client.js` | the profile row's client half | `remote.session.list` + the store route |
 
-The host half `lib/index.js` exists so that ① reaches the page: a durable client
-bundle can only `require` react, cordis and the slot/primitive/dockkit modules —
-the Package-private `harness`/`host` bridge is for dynamic packages only. It
-serves `GET /session-manager/state` with the serialized records. That route is
-**not** credential-gated (unlike the app's own pages), but the server binds
-`127.0.0.1` and the body is exactly the content of
-`<DSH_HOME>/session-manager/state.json` — the same local user could read that
-file anyway, so the route widens no exposure. It is not a secrecy boundary.
+The package has no third layer. It declares no `dsh.client`, exports no entry
+module, serves no route and owns no profile row: nothing here is sent to the
+browser.
 
 ## Notes and pitfalls
 
-- The client half declares `inject: ['remote', 'remote.session', 'slots']`.
-  `remote.session` is a Remote namespace **mounted as its own Cordis service** by
-  `ctx.remote.$mount(...)`, not a property of the `remote` service; reading it
-  undeclared is rejected by the Cordis guard (`cannot get property "remote.session"
-  without inject`) and the panel renders `error:` with 0 nodes.
-- The bundle's envelope id **must** be the package name
-  (`window.__ModuleLoader__.load({ id: '@local/dsh-session-manager', ... })`) —
-  that is how the module system matches a loaded factory to the graph row.
-- Editing `lib/client.js` needs **no restart**: the profile's `client-hmr` polls
-  each bundle's mtime/size every 500 ms and pushes a hot swap over SSE. Changing
-  `package.json`, the preset composition, or the profile row does need a
-  restart — that is what the boot scan reads.
-- Removing the row from `cordis.patch.yml` withdraws the canvas; deleting the
-  package directory withdraws the tools the preset row mounts.
+- The ② row publishes no service, so it must stay **outside** every `isolate`
+  realm in the composition. Behind one it would resolve a private registry the
+  preset never populates, and its tools would silently contribute nothing.
 - `state.json` is the package's only durable file. It is seeded once from the
   pre-0.2 `descriptions.json` when that file exists and `state.json` does not, so
   an upgrade in place keeps every note.
-- Upgrading from the standalone `@local/dsh-session-canvas` package: delete that
-  `- insert:` block from `cordis.patch.yml` and its directory under
-  `profiles/node_modules/@local/`; the merged package serves both halves now.
+- Editing `lib/store.mjs` / `lib/tools.mjs` takes effect on the next preset
+  mount. Changing `package.json` or the preset composition needs a restart.
+- The relative specifier in `agent.cordis.yml` counts on the package living at
+  `profiles/node_modules/@local/dsh-session-manager/`. Move it and the preset
+  stops mounting the tools.
+
+## Removing the 0.2 canvas
+
+0.3.0 deleted the client half — the canvas was not good enough to keep. If you
+are upgrading an existing install, three leftovers have to go by hand; the
+installer only reports them, because `cordis.patch.yml` is your file.
+
+1. The Loader row that existed only to get the client half served:
+   delete the `- insert:` block naming `@local/dsh-session-manager` (id
+   `session-manager`) from `$DSH_HOME/profiles/web/cordis.patch.yml`. A row
+   pointing at a package with no entry module is a boot error, not a no-op.
+2. `lib/client.js` and `lib/index.js` under
+   `$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/` — `install.sh`
+   removes these for you on the next run.
+3. If you also have the even older `$DSH_HOME/agent-canvas/` directory, nothing
+   loads it; delete it as well.
+4. Upgrading from the standalone `@local/dsh-session-canvas` package: delete that
+   `- insert:` block from `cordis.patch.yml` and its directory under
+   `profiles/node_modules/@local/`.
+
+Then restart the profile. Everything the package still does — the twelve
+`session_*` tools and the preset that mounts them — is unaffected.

@@ -1,31 +1,29 @@
 # DSH 会话管理器
 
-一个 [DSH](https://github.com/deepseek-ai/deepseek-harness) 扩展包，三层一体：
+一个 [DSH](https://github.com/deepseek-ai/deepseek-harness) 扩展包，两层一体：
 
 | 层 | 文件 | 作用 |
 |---|---|---|
 | ① 持久化 | `package/lib/store.mjs` | 每个会话的**关系信息**（父子、类型、目录、标题）与 **describe 私有备注**，落在 `<DSH_HOME>/session-manager/state.json`，重启不丢 |
 | ② 管理工具 | `package/lib/tools.mjs` | 12 个会话管理工具：读写 ①、指挥本进程内的其他会话、**新建会话**、**委托带回音** |
-| ③ 画布 | `package/lib/client.js` | 把这些持久化数据画成关系图（当前工作区，观察窗口） |
 
 配套的 `preset/` 是「会话管理」agent preset：**这个模式下的会话只用来管理其他会话**。它不写代码、不改文件、不跑命令、不访问网络，只能观察、分叉、标注、压缩、指挥本进程内的其他会话，并在这些会话与用户之间协调信息。
 
-> **想改这个包？先读 [`docs/DESIGN.md`](docs/DESIGN.md)**：设计意图、架构图、各层职责、九个关键决策的取舍（为什么一个包两个挂载点、为什么 ① 是模块而不是 Cordis 服务、为什么画布走同源路由、为什么委托回调是无状态轮询、为什么新建会话要判一次 `workspaceId`/`cwd`）、典型数据流、边界，以及「改哪一层要不要重启」。
+> **想改这个包？先读 [`docs/DESIGN.md`](docs/DESIGN.md)**：设计意图、架构图、各层职责、关键决策的取舍（为什么一个包两个安置点、为什么 ① 是模块而不是 Cordis 服务、为什么委托回调是无状态轮询、为什么新建会话要判一次 `workspaceId`/`cwd`）、典型数据流、边界，以及「改哪一层要不要重启」。
+
+> 0.3.0 起移除了 0.2 的会话画布（客户端半）：它没做好、可用性不高，已连同 host 路由与 profile 行一起删掉。会话管理工具与 preset 不受影响。
 
 ## 目录结构
 
 ```
-package/                             # @local/dsh-session-manager：唯一的包，三层都在里面
-├── package.json                     # exports: "." | "./client" | "./tools" | "./store"
+package/                             # @local/dsh-session-manager：唯一的包，两层都在里面
+├── package.json                     # exports: "./tools" | "./store"
 ├── lib/
 │   ├── store.mjs                    # ① 持久化存储（原子写 + stat 校验缓存）
-│   ├── tools.mjs                    # ② 12 个管理工具（preset 挂载这一层）
-│   ├── index.js                     # host 半：提供 GET /session-manager/state，把 ① 送给 ③
-│   └── client.js                    # ③ 画布（手写 classic-script bundle）
+│   └── tools.mjs                    # ② 12 个管理工具（preset 挂载这一层）
 ├── test/
-│   ├── tools.test.mjs               # 工具层冒烟测试（假 ctx + 临时 DSH_HOME）
-│   └── scope.test.mjs               # 画布「只画当前工作区」的纯函数测试
-└── INSTALL.md                       # 安装、三层、以及踩过的坑
+│   └── tools.test.mjs               # 工具层冒烟测试（假 ctx + 临时 DSH_HOME）
+└── INSTALL.md                       # 安装、两层、以及踩过的坑
 
 preset/                              # 挂 ② 的 agent preset
 ├── agent.cordis.yml                 # 组合；工具行按相对路径指回 package/
@@ -33,7 +31,7 @@ preset/                              # 挂 ② 的 agent preset
 
 docs/DESIGN.md                       # 设计文档：理念、架构、各层职责、取舍与验证
 
-install.sh                           # 一次装好：package + preset + profile 行
+install.sh                           # 一次装好：package + preset
 ```
 
 ## 安装
@@ -44,13 +42,12 @@ install.sh                           # 一次装好：package + preset + profile
 
 它写两个位置，但只有**一份** package 拷贝：
 
-- `$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/` —— 包本体（三层都在这里）；
-- `$DSH_HOME/.agent-presets/session-manager/` —— preset，它的工具行用相对路径 `../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs` 指回上面那份包；
-- `$DSH_HOME/profiles/web/cordis.patch.yml` —— 一行 Loader entry，客户端半（③）靠它才会被下发。
+- `$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/` —— 包本体（两层都在这里）；
+- `$DSH_HOME/.agent-presets/session-manager/` —— preset，它的工具行用相对路径 `../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs` 指回上面那份包。
 
-两个位置都是被机制逼出来的，不是选择（详见 `package/INSTALL.md`）：preset 行的**裸包名只从 harness 安装目录解析**，相对路径才够得着已安装的包；而客户端半只有 host Loader 的 entry 才会被扫描，preset 子树永远不被扫描。
+这两个位置都是被机制逼出来的，不是选择（详见 `package/INSTALL.md`）：preset 行的**裸包名只从 harness 安装目录解析**，相对路径才够得着已安装的包。包不再声明 `dsh.client`，所以**不需要** profile 行，也不提供任何 HTTP 路由。
 
-装完重启 profile。preset 发现本身每次都会重读 roots，所以改动 preset 不需要重启；改 `package.json` / profile 行则需要。
+装完重启 profile。preset 发现本身每次都会重读 roots，所以改动 preset 不需要重启；改 `package.json` 则需要（删掉 0.2 profile 行的那次改动也要重启才彻底生效）。
 
 ## 这个模式提供什么
 
@@ -109,7 +106,7 @@ install.sh                           # 一次装好：package + preset + profile
 }
 ```
 
-- **关系、备注、委托账本同库**：`session_list` 观测到的血统、`session_describe` 写的备注、`session_send(callback)` 记下的委托都进这一份文件，画布（③）读的也是它——所以「工具」和「画布」是同一份记录的两个视图。
+- **关系、备注、委托账本同库**：`session_list` 观测到的血统、`session_describe` 写的备注、`session_send(callback)` 记下的委托都进这一份文件，也是所有管理工具唯一读的那份记录。
 - **读**：每次先 `stat` 文件（mtime+size），变了才重读，因此就算有第二个模块实例/进程在写也不会读到陈旧缓存。
 - **写**：串行化 + 临时文件 `rename`，崩溃不会留下半截文件；**没有变化就不写**（重复 `session_list` 不会反复落盘，已结案的委托也不会被重复覆盖）。
 - **升级**：老的 `descriptions.json` 只在 `state.json` 不存在时被一次性读入，原地升级不丢备注。
@@ -175,7 +172,7 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 `session_describe({ sessionId, description? })`：
 
 - 给 `description` → 设置备注（trim 后截断到 200 字符）；给空串 → 清除；整个字段省略 → 读当前备注。若目标 `sessionId` 当前在进程中未找到，备注仍会被持久化存储，并附带 Warning 提示。
-- 它**不是会话标题**：不写进任何会话日志，所以侧栏、会话列表、轨迹视图、其他 agent 都看不到。只有本包的 `session_list` 会显示 `note:`，画布（读同一份 ①）会画在节点里与详情里。
+- 它**不是会话标题**：不写进任何会话日志，所以侧栏、会话列表、轨迹视图、其他 agent 都看不到。只有本包的 `session_list` 会显示 `note:`。
 - 清除备注**不会**清掉这个会话的血统记录——两者在同一条记录里但互不覆盖。
 - **它不是保密边界**：文件就在 DSH home 里，任何进程都能打开。它是**归属边界**——除了这个包，没有别的东西读写它。
 
@@ -203,9 +200,9 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 - **preset 默认值**：先取调用者会话记录里的 `agentPreset`，取不到才用 `standard`。所以「会话管理」会话默认会造出**另一个「会话管理」会话**；要派编码活就显式传 `preset:"standard"` 或 `"ptc"`。
 - **cwd 与工作区**：底层 `sessionController.create` 只接受 **`workspaceId` 或 `cwd` 二选一**（同时给直接 `gateway/bad-request`），而且**只有 `workspaceId` 那条路会把会话挂进工作区**。所以工具先查一次 `workspaceRegistry.resolveByPath(cwd)`：
   - cwd 正好是**已登记工作区的根目录** → 传 `workspaceId`，会话挂进该工作区（出现在侧栏的工作区里）；
-  - 否则 → 原样传 `cwd`，会话**不**挂任何工作区（画布仍会按目录把它画出来）。
+  - 否则 → 原样传 `cwd`，会话**不**挂任何工作区。
 - **title** 调一次 `rename`，**provider+model** 调一次 `selectModel`：这个新建的会话本来就有一个 idle 的活 agent，这两个调用会让它再醒一下；`selectModel` 还会把该模型顺带存成**部署默认**（与 `session_model` 同一个副作用）。任一步失败都**不会**丢掉已创建的 session——结果里会写「title NOT set / model NOT set」，id 照常返回。
-- 新会话会立刻写进 ①（顶层、cwd、标题），所以画布在下一次 `session_list` 之前就能看到它。
+- 新会话会立刻写进 ①（顶层、cwd、标题），所以下一次 `session_list` 之前就已经记得它。
 
 ## 分叉语义
 
@@ -217,32 +214,13 @@ await ctx.commands.execute({ id: sessionId }, '/compact', [], signal)
 - **标题**：可显式指定 `title`（截断至 60 字符）；不给 `title` 时自动改名为 `"<源标题> · fork"`（源会话无标题时为 `"fork"`）。
 - **注意**：切点之后源会话产生的内容**不在副本里**；副本站起来用的是**当前默认模型**。
 
-## 使用画布（③）
-
-画布是同一个包里的客户端半，占 `$DSH_HOME/profiles/web/cordis.patch.yml` 的一行 Loader entry，进程重启后依然在；删掉那一行即彻底撤下。
-
-- **只画当前工作区**：以 `shell.overlay` 标准 prop `useWorkspaces` 的 Workspace 投影为准，用与侧栏完全相同的推导（`items.find(item => item.sessionIds.includes(current))`）选出当前会话所属工作区；保留「该工作区登记的会话 ∪ cwd 位于工作区路径之下的会话（子会话常起在子目录）∪ 已保留会话的全部后代」。当前会话本身是子会话/分叉时，沿 `parentSessionId` 上溯。**找不到工作区时画 0 个节点**（并在画布上写明原因），不会退回「全部工作区」。
-- **读的是持久化数据**：图 = `session.list`（活会话）∪ ① 里还记着、但已经不在活列表里的会话（归档/删除过的，画成虚线灰底的 `remembered` 节点）。每个节点上的 `✎` 就是它的 describe 备注，详情栏里也有。
-- **两条数据通路**：`remote.session.list` 走已有 Remote 命名空间；① 走本包 host 半提供的 `GET /session-manager/state`。两条路各自失败互不拖累：store 读不到时画布退化成「只有活会话」，并在标题栏写明原因。
-  > 那条路由**自身不鉴权**（不像页面那样要求凭据），但服务只绑在 `127.0.0.1`，返回的内容与 `<DSH_HOME>/session-manager/state.json` 完全一致——同一个本地用户本来就能读那个文件，所以它没有扩大暴露面。**它不是保密边界**。
-- 交互：拖拽平移、`−`/`+` 缩放、「适应」重排、点节点看详情；每 4 秒刷新。
-
-> 客户端半必须声明 `inject: ['remote', 'remote.session', 'slots']`。`remote.session` 是 `ctx.remote.$mount` 挂上来的**独立 Cordis 服务**，不是 `remote` 服务的普通属性；不声明就访问会被 Cordis guard 拒绝：`cannot get property "remote.session" without inject`（面板报 `error:` 且 0 节点时先查这里）。
->
-> bundle 的 envelope id 必须等于包名（`@local/dsh-session-manager`），客户端模块系统靠它把 factory 对上 graph row。
->
-> 改完 `lib/client.js` **不必重启**：profile 里的 `client-hmr` 每 500ms 轮询 bundle 的 mtime/size，一变就经 SSE 推给页面热替换。
-
 ## 测试
 
 ```sh
 node package/test/tools.test.mjs     # 工具层 90 项
-node package/test/scope.test.mjs     # 画布作用域 18 项
 ```
 
 工具层用假 Cordis ctx + 临时 `DSH_HOME` 跑真实插件文件，覆盖：① 的迁移 / 落盘 / 不再重复落盘 / 清备注保留血统，`session_list` 的血统标注、备注、模型路由与观测落库，`session_read` 三档 detail，模型目录的渲染与失败项，模型**读取**（优先 projection、回退 fold、不 resume）与**切换**（字段完整、半对参数被拒、副作用披露），发送/自投递/空文本拦截、取消、分叉与自动命名，排队消息读取（顺序、`placement`、截断、空队列、冷会话、读完即释放控制流、只读性），压缩（替目标跑 `/compact`、传出真实信号与空附件、拒绝结果、无压缩 preset、冷会话、自压缩拦截），以及**委托回调**（记账、任务摘要、无 callback 不记账、无调用者身份被拒、watcher 定时器注册、结案带答复、结果投回委托方、已结案不重复通知、失败轮次带原因、接纳之前的 `turn/end` 不算数、状态过滤、`session_queue` 的委托标记、`dismiss`）与**新建会话**（返回 id、默认 preset 与 cwd、`workspaceId`/`cwd` 互斥分流、显式 preset、`title` 与 `selectModel` 调用、继承调用者 preset、半个模型对被拒、未知 preset 的引导、title 失败不丢 session、写入 ①）。
-
-作用域测试用 `new Function` 从**真实 bundle** 里切出作用域纯函数再断言，所以断言跑的是出货文件本身；helper 的注释标记一旦移动，测试会直接报错而不是静默通过。
 
 ## 重要边界
 
@@ -251,9 +229,9 @@ node package/test/scope.test.mjs     # 画布作用域 18 项
 - **`session_send` 等于用户消息**：写进去的就是目标会话日志里的用户消息，目标会真的开始干活。
 - **`session_compact` 改写目标历史**：它替换目标会话的上下文并把事务写进它的日志；压缩不可撤销（除了分叉或重来）。
 - **回调是"盯日志"，不是对方的配合**：`callback` 只要求目标把那一轮跑完并在日志里留下痕迹。如果那条提示**始终没被接纳**（目标一直忙、或它的日志被压缩/清理掉了切点），委托会一直是 `pending`；此时以 `session_delegations` 的账本和 `session_queue` 的队列为准，必要时 `dismiss` 收尾。
-- **画布必须占一行 Loader entry**：客户端半放在 preset 里不会被扫描到。**画布只显示当前工作区**，进程内其他工作区的会话不在图上（刻意的）。
-- **记录不随会话删除**：① 按 session id 存；会话被删或归档后条目仍在（不清理，避免误删仍在用的备注），画布把它们画成 `remembered`。
+- **没有视图**：0.3.0 移除了会话画布，这个包只提供工具，不向浏览器下发任何东西，也没有 HTTP 路由。
+- **记录不随会话删除**：① 按 session id 存；会话被删或归档后条目仍在（不清理，避免误删仍在用的备注）。它下次再出现时，备注与血缘原样还在。
 
 ## 出处
 
-从一台运行中的 DSH 上导出并演进：preset 已通过 `ctx.agentPresets.standingKeyFor()` **真实挂载校验**（组合能导入、config 合法、每行都能激活、没有把服务发布进根 realm）；包的手写 bundle 已用假 `window.__ModuleLoader__` 验证 envelope、`inject` 与两个 slot 注册；工具层与作用域测试全绿。
+从一台运行中的 DSH 上导出并演进：preset 已通过 `ctx.agentPresets.standingKeyFor()` **真实挂载校验**（组合能导入、config 合法、每行都能激活、没有把服务发布进根 realm）；工具层测试全绿。

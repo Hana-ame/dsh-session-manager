@@ -1,8 +1,8 @@
 /**
  * Session-management tools — layer ② of the `@local/dsh-session-manager` package.
  *
- * The package holds all three layers: this file (the tools), `store.mjs` (the
- * durable per-session records) and `client.js` (the canvas that renders them).
+ * The package holds both layers: this file (the tools) and `store.mjs` (the
+ * durable per-session records).
  * The preset's row names this file through a relative path reaching into the
  * package directory, because `@deepseek-ai/dsh-agent-presets` resolves a bare
  * package name from the HARNESS install while a "."-prefixed specifier goes
@@ -25,8 +25,8 @@
  *
  * Persistence: both the describe note (`session_describe`) and the lineage each
  * listing observes (`session_list`) go through `./store.mjs` into
- * `<DSH_HOME>/session-manager/state.json`, which is also what the canvas reads —
- * the tools and the canvas are two views of one record set. A note is
+ * `<DSH_HOME>/session-manager/state.json`: the one record set both the tools
+ * that write it and the tools that report on it read. A note is
  * deliberately not a session title: it is never appended to any session log, so
  * the session list, the sidebar, the trajectory view and every other consumer of
  * that session never see it. It is not a secrecy boundary — the file sits in the
@@ -86,8 +86,9 @@ const shortId = (id) => (id.length > 10 ? `…${id.slice(id.length - 8)}` : id);
 
 // ── per-session notes and observed lineage, owned by this package ───────────
 //
-// The durable layer lives in ./store.mjs so that the canvas half reads exactly
-// what these tools write. These two adapters keep the tool bodies unchanged.
+// The durable layer lives in ./store.mjs so that every reader of the records
+// reads exactly what these tools write. These two adapters keep the tool bodies
+// unchanged.
 
 /** The current note for one session, or null when none is attached. */
 const noteOf = async (sessionId) => {
@@ -472,8 +473,8 @@ export default {
         }
 
         // Persist the relations this listing just observed, so they outlive the
-        // sessions they describe and the canvas can render them. A failure here
-        // must not hide the listing itself.
+        // sessions they describe and later listings can still report them. A
+        // failure here must not hide the listing itself.
         try {
           await observe(rows.map((row) => ({
             id: row.id,
@@ -1041,8 +1042,8 @@ export default {
           }
         }
 
-        // Record it in the durable ledger straight away, so the canvas shows it
-        // before the next listing observes it.
+        // Record it in the durable store straight away, so the next listing
+        // reports it even before any listing observes it.
         try {
           await observe([{ id: sessionId, parentId: null, kind: 'top-level', cwd: workspace !== null ? workspace.path : cwd, title: title.length > 0 ? title : null }]);
         } catch (error) {
@@ -1058,7 +1059,7 @@ export default {
 
     const describeTool = {
       name: 'session_describe',
-      description: "Attach, change, or read a private note for one session — one short line saying what that session is FOR, or what you are waiting on from it. The note is NOT the session title: this preset stores it in its own file and never appends it to any session log, so the session list, the sidebar, the trajectory view and every other agent never see it. It is shown by this preset's session_list and, when the Session Canvas plugin is running, under the node on the canvas. Omit `description` to read the current note; pass an empty string to clear it.",
+      description: "Attach, change, or read a private note for one session — one short line saying what that session is FOR, or what you are waiting on from it. The note is NOT the session title: this preset stores it in its own file and never appends it to any session log, so the session list, the sidebar, the trajectory view and every other agent never see it. It is shown by this preset's session_list. Omit `description` to read the current note; pass an empty string to clear it.",
       parameters: {
         type: 'object',
         properties: {

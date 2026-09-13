@@ -16,9 +16,8 @@
 # `@local/dsh-session-manager` package (see the `tool-session-control` row).
 #
 # The tools row names the PACKAGE, not a file in this directory, so the package
-# stays the single source of truth for all three of its layers: the durable
-# records (lib/store.mjs), the tools (lib/tools.mjs) and the canvas
-# (lib/client.js). The specifier is relative because
+# stays the single source of truth for both of its layers: the durable records
+# (lib/store.mjs) and the tools (lib/tools.mjs). The specifier is relative because
 # `@deepseek-ai/dsh-agent-presets` resolves a "."-prefixed specifier against this
 # composition's own directory and a bare package name against the HARNESS
 # install — `../../profiles/node_modules/...` is the one form that reaches the
