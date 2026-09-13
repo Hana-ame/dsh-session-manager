@@ -56,7 +56,9 @@
 
 ### ① `lib/store.mjs` — 持久化
 
-数据模型（`state.json`，`version: 2`）：
+数据模型（`state.json`，`version: 3`）分两块，同一个文件、同一个写者：
+
+**每会话记录 `byId[<sessionId>]`**
 
 | 字段 | 来自 | 说明 |
 |---|---|---|
@@ -65,6 +67,16 @@
 | `parentId` / `kind` | ② `session_list` 观测 | 父会话 id 与类型（`top-level` / `fork` / `subagent`） |
 | `cwd` / `title` | ② `session_list` 观测 | 最后一次观测到的位置与标题 |
 | `firstSeenAt` | ① | 这个包第一次记下该会话的时间 |
+
+**委托账本 `delegations[]`**（最新在前，保留 200 条）
+
+| 字段 | 说明 |
+|---|---|
+| `id` / `from` / `to` | 委托 id、委托方会话、目标会话 |
+| `task` / `mode` | 交付出去的任务摘要（≤200 字符）与投递模式 |
+| `status` | `pending` / `done` / `failed` / `unknown` |
+| `createdAt` / `baselineSeq` | 记账时间，以及投递前目标的最后事件序号（判定切点，见 D8） |
+| `settledAt` / `reply` / `note` | 结案时间、目标这一轮的答复（≤1200 字符）、结案原因或回调投递失败说明 |
 
 读写语义（每条都有理由）：
 
@@ -78,12 +90,12 @@
 
 ### ② `lib/tools.mjs` — 管理工具
 
-10 个工具按意图分四类：
+11 个工具按意图分四类：
 
 | 类别 | 工具 | 写 ① 吗 |
 |---|---|---|
-| 观察 | `session_list`、`session_read`、`session_queue` | `session_list` 会（观测血缘）；另两个不会 |
-| 驱动 | `session_send`、`session_stop`、`session_compact`、`session_fork` | 不会（只写目标会话日志） |
+| 观察 | `session_list`、`session_read`、`session_queue`、`session_delegations` | `session_list` 会（观测血缘）；`session_delegations` 会（结案委托，见 D8）；另两个不会 |
+| 驱动 | `session_send`、`session_stop`、`session_compact`、`session_fork` | `session_send(callback)` 会记账；其余只写目标会话日志 |
 | 记录 | `session_describe` | 会 |
 | 模型 | `session_models`、`session_model` | 不会 |
 
@@ -198,7 +210,27 @@ for await (const frame of controller.control(abort.signal)) {
 
 `break` 会等这个流自己取消，而那个取消信号**正是我们手里的这一个**；不先 abort 就 break，会死锁在 `iterator.return()` 上。测试里用一个「等 abort 才结束」的假生成器把这条钉死。
 
-## 5. 三条典型数据流
+### D8 委托回调 = 无状态轮询 + 读目标的持久日志
+
+需求是：`session_send` 把活派出去之后，委托方要能**被动**收到"对方做完了/失败了 + 它说了什么"。四种做法：
+
+| 方案 | 为什么不用 |
+|---|---|
+| 对方主动调一个 `session_reply` 工具 | 要求被委托的会话**也**跑在会话管理模式里。可现实中委托目标通常是 `standard`/`ptc` 编码会话，它们**没有**这个包的工具；这条路的适用范围比看起来小得多 |
+| 监听 host 事件 `session/event` / `agent/inbox/claimed` | 机制上最漂亮（`session/event` 是每条会话事件提交后的广播，`agent/inbox/claimed` 正好是"消息被这一轮接纳"），但事件是**按 scope 过滤**的（`this: Scoped<Session>`），委托方 preset 的 scope 未必收得到别的 preset 下会话的事件；而且监听器是内存状态，进程一重启就没了 |
+| `sessionController.follow()` 流 | 每个委托要握住一条流，退出时要处理"先 abort 再 break"的顺序陷阱（见 D7），重启后还得重放游标 |
+| **轮询目标的持久日志**（选它） | 无状态：判定完全由 `baselineSeq` + 目标日志推导，重启后挂载时重新开始轮询即可，pending 的委托自动续上；而且极易测试（把事件数组喂进去断言结论） |
+
+判定规则（正确性的全部就在这两行）：
+
+- **我们的提示 = `baselineSeq` 之后的第一条用户消息**（`source.kind === 'user'`）；
+- **结局 = 那条消息之后的第一个 `turn/end`**；两者之间的最后一条 `assistant/message` 文本就是答复。
+
+**为什么必须等"接纳"**：`mode:"queue"` 时目标可能正跑着上一轮，那个 `turn/end` 与你的委托无关。若不以"出现那条用户消息"为界，会在目标的上一轮结束时误报成功并附上**别人的**答复。这条规则在测试里被单独钉住（`a turn that ends before the prompt is admitted leaves it pending`）。
+
+**代价**：5 秒粒度（不是即时）；每个 tick 只在存在 `pending` 时才读盘，所以空闲代价约为一次内存判断。若部署里没有 `timer` 服务，推送这条腿不启用，但 `session_delegations` 的拉取仍然工作（它读之前强制跑一遍检查）——推送是尽力而为，账本才是真相。
+
+## 5. 四条典型数据流
 
 **A. 协调者列一次表**
 
@@ -229,15 +261,37 @@ for await (const frame of controller.control(abort.signal)) {
    └─ buildLayout → drawScene（备注画在节点第 3 行，remembered 用虚线灰底）
 ```
 
+**D. 一次委托与它的回调**
+
+```
+② session_send({sessionId: T, text, callback: true})
+   ├─ inspect(T)                      → baselineSeq = T 的最后序号
+   ├─ prompt(T, queue)                → 提示进入 T 的 inbox
+   ├─ addDelegation({from: me, to: T, task, baselineSeq, status: 'pending'})   → ① 落盘
+   └─ ok("… callback dlg-… registered")
+
+   … 若干秒后，② 的轮询 tick（timer 服务，每 5 秒且仅在存在 pending 时读盘）
+   ├─ readState()                     → 取出 pending 委托
+   ├─ inspect(T)                      → T 的日志
+   ├─ readDelegationOutcome(events, baselineSeq)
+   │     第一条 user/message（接纳）→ 之后的第一个 turn/end（结局）
+   │     中间的 assistant/message 文本 = 答复
+   ├─ settleDelegation(id, {status, reply, note})   → ① 落盘（只接受仍 pending 的记录）
+   └─ prompt(me, queue, "[委托回调] …")             → 结果排进委托方自己的 inbox
+
+   （任一步失败都不影响别的：目标读不到就保持 pending，通知投不出去就在 note 里写明）
+```
+
 ## 6. 边界与已知取舍
 
 - **记录不是保密边界**：`state.json` 与那条 state 路由对同一个本地用户可读。它是**归属边界**——除了这个包，没有别的东西读写它；备注也从不写进任何会话日志，所以侧栏、会话列表、轨迹视图和其他 agent 都看不到。
 - **`session_compact` 改写目标历史**：可压缩段被替换成一个摘要节点，事务写进目标日志。除分叉或重来之外不可撤销。
 - **画布只显示当前工作区**，跨工作区的关系不在图上（① 里仍在）。
 - **记录不随会话删除**：① 按 session id 存，会话被删/归档后条目还在（画布画成 `remembered`）。不自动清理，避免误删仍在用的备注。
+- **委托可能一直 `pending`**：如果那条提示始终没被目标接纳（它一直忙），或者目标的日志被压缩/清理掉了判定切点，回调就不会结案。推送是尽力而为，`session_delegations` 的账本才是真相，必要时用 `dismiss` 收尾。
 - **只看得见本进程**：`sessionController` 是本进程的会话表。
 - **子会话不由本模式驱动**：`origin:"subagent"` 的会话被 ownership fence 拦住，只有它的活父会话能驱动；分叉不受此限制。
-- **未做**：把 remembered 节点的备注同步回目标会话标题；跨工作区视图；冷会话压缩（需先唤醒）。
+- **未做**：把 remembered 节点的备注同步回目标会话标题；跨工作区视图；冷会话压缩（需先唤醒）；在画布上画委托/回调边；`unknown` 状态的自动超时（目前只有人工 `dismiss`）。
 
 ## 7. 改动指南（哪一步要重启）
 
@@ -249,11 +303,13 @@ for await (const frame of controller.control(abort.signal)) {
 
 新增一个工具：写进 `lib/tools.mjs` 并 `ctx.tools.register(...)`，补 `package/test/tools.test.mjs`，把工具名加进 `agent.cordis.yml` 的 persona 清单与 `preset.yml` 描述。
 新增一个持久字段：在 `lib/store.mjs` 的 `blankRecord`/`normalizeRecord`/对应 writer 三处同时加，`STATE_VERSION` 递增；画布按需在 `normalize`/`normalizeStored` 里消费。
+新增一种持久记录（像 `delegations` 那样）：同样的三处 + `parseState` 里补一段读取，并且**所有既有 writer 都必须 `{...state, …}` 地展开**——否则一次备注写入就会把这类新记录抹掉（`tools.test.mjs` 里的 `note write kept ledger` 就是钉这条的）。
+改动回调判定规则（D8）：规则集中在 `readDelegationOutcome(events, baselineSeq)` 一个纯函数里，改它必须同时改测试里的脚本化日志。
 
 ## 8. 怎么验证
 
 ```sh
-node package/test/tools.test.mjs    # ② 与 ①：61 项
+node package/test/tools.test.mjs    # ② 与 ①：77 项
 node package/test/scope.test.mjs    # ③ 的纯函数：18 项
 dsh --profile web --dump-config | grep -A1 session-manager   # profile 行进了组合
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3080/session-manager/state   # 200 = host 半活着

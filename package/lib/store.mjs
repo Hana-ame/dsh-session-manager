@@ -13,6 +13,11 @@
 // a fork whose parent session has since been archived still shows its edge, and
 // the canvas renders exactly the records the tools write.
 //
+// The same file also holds the **delegation ledger**: one record per
+// `session_send(..., callback: true)`, with its target, the task excerpt and the
+// reply the target produced. It is a durable relation too, and keeping it in one
+// file means one writer, one atomic write and one reader cover both.
+//
 // Reads are stat-validated, so a writer in another module instance (or another
 // process) is noticed instead of being answered from a stale cache; writes are
 // serialized per instance and flushed with a temp file + rename, so a crash
@@ -22,11 +27,19 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /** Current on-disk format. */
-export const STATE_VERSION = 2
+export const STATE_VERSION = 3
 /** Cap on a describe note, in characters. */
 export const NOTE_MAX_CHARS = 200
 /** Cap on a persisted title, in characters. */
 export const TITLE_MAX_CHARS = 120
+/** Cap on the task excerpt one delegation keeps. */
+export const DELEGATION_TASK_CHARS = 200
+/** Cap on the reply one delegation keeps. */
+export const DELEGATION_REPLY_CHARS = 1200
+/** How many delegations the ledger retains (newest first). */
+export const DELEGATION_KEEP = 200
+/** Every state a delegation record can be in. */
+export const DELEGATION_STATUSES = ['pending', 'done', 'failed', 'unknown']
 /** Path cap, generous enough for any real working directory. */
 const PATH_MAX_CHARS = 4096
 
@@ -85,9 +98,48 @@ const normalizeRecord = (value) => {
   return isBlank(record) ? null : record
 }
 
+/** One empty state: no records, no delegations. */
+export const blankState = () => ({ version: STATE_VERSION, byId: {}, delegations: [] })
+
+/** One empty delegation record, in its absent form. */
+export const blankDelegation = () => ({
+  id: '',
+  from: '',
+  to: '',
+  task: '',
+  mode: 'queue',
+  status: 'pending',
+  createdAt: 0,
+  baselineSeq: 0,
+  settledAt: 0,
+  reply: '',
+  note: '',
+})
+
+/** Normalize one on-disk delegation; a record without an id or endpoints is dropped. */
+const normalizeDelegation = (value) => {
+  if (value === null || typeof value !== 'object') return null
+  if (typeof value.id !== 'string' || value.id.length === 0) return null
+  if (typeof value.from !== 'string' || value.from.length === 0) return null
+  if (typeof value.to !== 'string' || value.to.length === 0) return null
+  return {
+    id: value.id,
+    from: value.from,
+    to: value.to,
+    task: typeof value.task === 'string' ? clip(value.task, DELEGATION_TASK_CHARS) : '',
+    mode: value.mode === 'steer' ? 'steer' : 'queue',
+    status: DELEGATION_STATUSES.includes(value.status) ? value.status : 'pending',
+    createdAt: asTime(value.createdAt),
+    baselineSeq: typeof value.baselineSeq === 'number' && Number.isFinite(value.baselineSeq) && value.baselineSeq > 0 ? Math.floor(value.baselineSeq) : 0,
+    settledAt: asTime(value.settledAt),
+    reply: typeof value.reply === 'string' ? clip(value.reply, DELEGATION_REPLY_CHARS) : '',
+    note: typeof value.note === 'string' ? clip(value.note, 400) : '',
+  }
+}
+
 /** Parse a state file; anything unreadable degrades to an empty state, never a throw. */
 const parseState = (raw) => {
-  const state = { version: STATE_VERSION, byId: {} }
+  const state = blankState()
   let parsed = null
   try {
     parsed = JSON.parse(raw)
@@ -100,12 +152,17 @@ const parseState = (raw) => {
     const record = normalizeRecord(source[id])
     if (record !== null) state.byId[id] = record
   }
+  const delegations = Array.isArray(parsed.delegations) ? parsed.delegations : []
+  for (const value of delegations) {
+    const delegation = normalizeDelegation(value)
+    if (delegation !== null) state.delegations.push(delegation)
+  }
   return state
 }
 
 /** Seed from the pre-0.2 notes file, so an upgrade in place keeps every note. */
 const seedFromLegacy = async () => {
-  const state = { version: STATE_VERSION, byId: {} }
+  const state = blankState()
   let raw = null
   try {
     raw = await readFile(legacyPath(), 'utf8')
@@ -199,7 +256,7 @@ export const setNote = (sessionId, description) =>
     const byId = { ...state.byId }
     if (isBlank(record)) delete byId[sessionId]
     else byId[sessionId] = record
-    return { version: STATE_VERSION, byId }
+    return { ...state, byId }
   })
 
 /**
@@ -224,8 +281,67 @@ export const observe = (rows) =>
       changed = true
       byId[row.id] = { ...existing, parentId, kind, cwd, title, firstSeenAt: existing.firstSeenAt > 0 ? existing.firstSeenAt : now }
     }
-    return changed ? { version: STATE_VERSION, byId } : null
+    return changed ? { ...state, byId } : null
   })
 
 /** One session's persisted record, or undefined. */
 export const recordOf = (state, sessionId) => (state !== null && state !== undefined && state.byId !== null && state.byId !== undefined ? state.byId[sessionId] : undefined)
+
+// ── delegations: session_send(callback) and its outcome ledger ───────────────
+//
+// A delegation is a durable relation between two sessions: "I asked you to do
+// this, and here is what came back". It lives in the same file as the notes so
+// one writer, one atomic write and one reader cover both, and so a delegation
+// outlives the process that created it — the watcher can pick a pending one up
+// again after a restart, because completion is decided from the TARGET's durable
+// log rather than from anything held in memory.
+
+/** Record one delegation. Newest first; the ledger keeps the newest DELEGATION_KEEP entries. */
+export const addDelegation = (delegation) =>
+  change((state) => {
+    const record = normalizeDelegation(delegation)
+    if (record === null) return null
+    const delegations = [record, ...state.delegations.filter((item) => item.id !== record.id)].slice(0, DELEGATION_KEEP)
+    return { ...state, delegations }
+  })
+
+/**
+ * Settle one delegation that is still pending. A record that already settled is
+ * left alone (returning null skips the write), so a second watcher pass can
+ * never overwrite a recorded outcome.
+ */
+export const settleDelegation = (id, patch) =>
+  change((state) => {
+    const index = state.delegations.findIndex((item) => item.id === id)
+    if (index < 0) return null
+    if (state.delegations[index].status !== 'pending') return null
+    const merged = normalizeDelegation({ ...state.delegations[index], ...patch, settledAt: patch.settledAt !== undefined ? patch.settledAt : Date.now() })
+    if (merged === null) return null
+    const delegations = state.delegations.slice()
+    delegations[index] = merged
+    return { ...state, delegations }
+  })
+
+/** Append one note to a delegation in any state — used when the callback notice itself could not be delivered. */
+export const noteDelegation = (id, text) =>
+  change((state) => {
+    const index = state.delegations.findIndex((item) => item.id === id)
+    if (index < 0) return null
+    const current = state.delegations[index]
+    const note = current.note.length > 0 ? `${current.note} ${text}` : text
+    const merged = normalizeDelegation({ ...current, note })
+    if (merged === null || merged.note === current.note) return null
+    const delegations = state.delegations.slice()
+    delegations[index] = merged
+    return { ...state, delegations }
+  })
+
+/** Forget one delegation record. */
+export const dropDelegation = (id) =>
+  change((state) => {
+    const delegations = state.delegations.filter((item) => item.id !== id)
+    return delegations.length === state.delegations.length ? null : { ...state, delegations }
+  })
+
+/** Every delegation still waiting for its target, oldest first. */
+export const pendingDelegations = (state) => (state !== null && state !== undefined && Array.isArray(state.delegations) ? state.delegations.filter((item) => item.status === 'pending') : [])

@@ -27,6 +27,14 @@ const captured = {}
 const calls = []
 /** Every signal a tool handed to the live control stream, so cancellation is observable. */
 const controlSignals = []
+/**
+ * Per-session event logs the fake `inspect` answers from. A target that is not
+ * listed here falls back to the shared `events` array; a test appends to a log
+ * to simulate that session doing work after a prompt was delivered.
+ */
+const logs = {}
+/** The callbacks the plugin registered on the timer service, so ticks are manual. */
+const ticks = []
 
 const events = [
   { type: 'user/message', seq: 1, time: 1000, data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'hello there' }], source: { kind: 'user' } } },
@@ -45,7 +53,7 @@ const controller = {  list: async () => ({ items: [
     { sessionId: 'session-b', updatedAt: 1690000000000, running: false, blank: false, cwd: '/tmp/repo', parentSessionId: 'session-a', projections: { values: { title: 'Alpha · fork' } } },
     { sessionId: 'session-c', updatedAt: 1680000000000, running: false, blank: false, cwd: '/tmp/repo', parentSessionId: 'session-a', origin: 'subagent' },
   ] }),
-  inspect: async () => ({ meta: { id: 'session-a', cwd: '/tmp/repo' }, inheritedEventCount: 0, events }),
+  inspect: async (sessionId) => ({ meta: { id: sessionId, cwd: '/tmp/repo' }, inheritedEventCount: 0, events: logs[sessionId] ?? events }),
   prompt: async (request) => { calls.push(['prompt', request.sessionId, request.mode, request.content[0].text]); return { accepted: true } },
   cancel: async (request) => { calls.push(['cancel', request.sessionId]); return { accepted: true } },
   control: (signal) => {
@@ -101,8 +109,11 @@ const commands = {
 /** Everything has a live agent here except `session-cold`, which never attached. */
 const agents = { get: (id) => (id === 'session-cold' ? undefined : { id }) }
 
+/** The timer service, captured so the test decides when the watcher runs. */
+const timer = { interval: (callback) => { ticks.push(callback); return () => {} } }
+
 register.apply({
-  get: (name) => (name === 'sessionController' ? controller : (name === 'commands' ? commands : (name === 'agents' ? agents : undefined))),
+  get: (name) => (name === 'sessionController' ? controller : (name === 'commands' ? commands : (name === 'agents' ? agents : (name === 'timer' ? timer : undefined)))),
   tools: { register: (definition) => { captured[definition.name] = definition } },
 })
 
@@ -116,8 +127,8 @@ const check = (label, condition, detail) => {
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-check('ten tools registered', same(Object.keys(captured).sort(), [
-  'session_compact', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
+check('eleven tools registered', same(Object.keys(captured).sort(), [
+  'session_compact', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
 ]), Object.keys(captured).join(','))
 
 // The pre-0.2 note file must survive an in-place upgrade. Seed one before the
@@ -249,6 +260,72 @@ check('compact explains a cold session',
 check('compact refuses the caller itself',
   (await captured.session_compact.execute({ sessionId: 'me' }, callerExec)).ok === false)
 check('compact requires a sessionId', (await captured.session_compact.execute({}, callerExec)).ok === false)
+
+// session_send callback: the ledger, the watcher, and the notice back
+const ledger = async () => JSON.parse(await readFile(statePath, 'utf8')).delegations
+const sentWithCallback = await captured.session_send.execute({ sessionId: 'session-b', text: 'summarise the parser work', callback: true }, callerExec)
+check('send with callback announces the delegation',
+  sentWithCallback.ok === true && sentWithCallback.text.includes('callback dlg-'), sentWithCallback.text)
+const afterSend = await ledger()
+check('callback records a pending delegation',
+  afterSend.length === 1 && afterSend[0].status === 'pending' && afterSend[0].to === 'session-b' && afterSend[0].from === 'me' && afterSend[0].mode === 'queue',
+  JSON.stringify(afterSend))
+check('the delegation keeps the delivered text as its task', afterSend[0].task === 'summarise the parser work')
+check('send without callback records nothing',
+  (await captured.session_send.execute({ sessionId: 'session-c', text: 'no callback here' }, callerExec)).ok === true && (await ledger()).length === 1)
+check('callback without a caller identity is refused',
+  (await captured.session_send.execute({ sessionId: 'session-c', text: 'x', callback: true }, bareExec)).ok === false)
+check('a watcher tick is registered', ticks.length === 1)
+
+// Now the target works: our prompt is admitted, it answers, the turn ends.
+logs['session-b'] = [
+  { type: 'turn/end', seq: 10, time: 10, data: { turn: 9, reason: { kind: 'completed' } } },
+  { type: 'user/message', seq: 11, time: 11, data: { id: 'm10', role: 'user', content: [{ type: 'text', text: 'summarise the parser work' }], source: { kind: 'user' } } },
+  { type: 'assistant/message', seq: 12, time: 12, data: { turn: 10, step: 1, message: { content: [{ type: 'text', text: 'parser work is done; two files changed' }] } } },
+  { type: 'turn/end', seq: 13, time: 13, data: { turn: 10, reason: { kind: 'completed' } } },
+]
+ticks[0]()
+const ledgerText = (await captured.session_delegations.execute({}, callerExec)).text
+check('the ledger tool checks first and reports the settled row',
+  ledgerText.includes('done') && ledgerText.includes('parser work is done'), ledgerText)
+const settledRows = await ledger()
+check('the delegation settles done with the reply it produced',
+  settledRows[0].status === 'done' && settledRows[0].reply === 'parser work is done; two files changed', JSON.stringify(settledRows[0]))
+check('the outcome is delivered into the delegator session as a queued message',
+  calls.some((c) => c[0] === 'prompt' && c[1] === 'me' && c[2] === 'queue' && c[3].includes('[委托回调]') && c[3].includes('parser work is done')),
+  JSON.stringify(calls.filter((c) => c[0] === 'prompt' && c[1] === 'me').map((c) => c[3])))
+const mePrompts = () => calls.filter((c) => c[0] === 'prompt' && c[1] === 'me').length
+const deliveredOnce = mePrompts()
+ticks[0]()
+await captured.session_delegations.execute({}, callerExec)
+check('a settled delegation is never delivered twice', mePrompts() === deliveredOnce, String(mePrompts()))
+
+// A turn that ends badly settles as failed, with the reason and whatever prose came out.
+await captured.session_send.execute({ sessionId: 'session-big', text: 'big job', callback: true }, callerExec)
+logs['session-big'] = [
+  { type: 'user/message', seq: 10, time: 10, data: { id: 'm20', role: 'user', content: [{ type: 'text', text: 'big job' }], source: { kind: 'user' } } },
+  { type: 'assistant/message', seq: 11, time: 11, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'starting' }] } } },
+  { type: 'turn/end', seq: 12, time: 12, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+]
+await captured.session_delegations.execute({}, callerExec)
+const failedRow = (await ledger()).find((row) => row.to === 'session-big')
+check('a bad ending settles as failed with its reason',
+  failedRow.status === 'failed' && failedRow.note.includes('aborted') && failedRow.reply === 'starting', JSON.stringify(failedRow))
+
+// A turn/end BEFORE our prompt is admitted says nothing about the task.
+await captured.session_send.execute({ sessionId: 'session-quiet', text: 'still waiting', callback: true }, callerExec)
+logs['session-quiet'] = [{ type: 'turn/end', seq: 10, time: 10, data: { turn: 2, reason: { kind: 'completed' } } }]
+await captured.session_delegations.execute({}, callerExec)
+const quietRow = (await ledger()).find((row) => row.to === 'session-quiet')
+check('a turn that ends before the prompt is admitted leaves it pending', quietRow.status === 'pending')
+check('the status filter selects it', (await captured.session_delegations.execute({ status: 'pending' }, callerExec)).text.includes(quietRow.id))
+check('session_queue marks the target of a delegation',
+  (await captured.session_queue.execute({ sessionId: 'session-b' }, callerExec)).text.includes('Delegations to session-b: 1 recorded'))
+const toDismiss = (await ledger())[0]
+check('dismiss forgets a row',
+  (await captured.session_delegations.execute({ dismiss: toDismiss.id }, callerExec)).text.includes(`Forgot delegation ${toDismiss.id}`))
+check('the dismissed row is gone',
+  (await ledger()).length === 2 && (await ledger()).every((row) => row.id !== toDismiss.id))
 
 const failures = results.filter((row) => row[0] === 'FAIL')
 for (const [status, label, detail] of results) console.log(`${status}  ${label}${detail}`)

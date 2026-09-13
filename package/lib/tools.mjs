@@ -33,12 +33,20 @@
  * DSH home and any process could open it — it is a provenance boundary: nothing
  * else writes it.
  */
-import { NOTE_MAX_CHARS, observe, readState, setNote, statePath } from './store.mjs'
+import { addDelegation, dropDelegation, noteDelegation, observe, pendingDelegations, readState, settleDelegation, setNote, statePath, NOTE_MAX_CHARS } from './store.mjs'
 
 let requestSeq = 0;
 
 /** Mint one prompt correlation id for `sessionController.prompt`. */
 const nextRequestId = () => `preset-session-${Date.now().toString(36)}-${(++requestSeq).toString(36)}`;
+
+let delegationSeq = 0;
+
+/** Mint one delegation id. */
+const nextDelegationId = () => `dlg-${Date.now().toString(36)}-${(++delegationSeq).toString(36)}`;
+
+/** How often a pending delegation is re-checked while one exists. */
+const DELEGATION_POLL_MS = 5000;
 
 /**
  * `sessionController.prompt()` calls `signal.throwIfAborted()` unconditionally,
@@ -205,6 +213,53 @@ const textOfToolResult = (message) => {
   return out;
 };
 
+/**
+ * Decide one delegation's outcome from the TARGET's durable event log.
+ *
+ * The delivered prompt is the first user-authored message after `baselineSeq`,
+ * and the outcome is the first `turn/end` after that, with the assistant prose
+ * in between as the reply. A `turn/end` BEFORE the prompt is admitted is
+ * ignored: with mode="queue" the target may already be mid-turn, and that turn
+ * ending says nothing about the task. Reading the answer out of the log (rather
+ * than off an in-memory watcher) is what lets a delegation survive a restart.
+ *
+ * @param events - the target session's events, oldest first.
+ * @param baselineSeq - the target's last sequence when the prompt was delivered.
+ * @returns the outcome to settle with, or null while it is still running.
+ */
+const readDelegationOutcome = (events, baselineSeq) => {
+  if (!Array.isArray(events)) return null;
+  let armed = false;
+  let reply = '';
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue;
+    if (typeof event.seq !== 'number' || !Number.isFinite(event.seq) || event.seq <= baselineSeq) continue;
+    const data = event.data !== null && typeof event.data === 'object' ? event.data : null;
+    if (!armed) {
+      const source = data !== null ? data.source : undefined;
+      if (event.type === 'user/message' && source !== null && source !== undefined && typeof source === 'object' && source.kind === 'user') armed = true;
+      continue;
+    }
+    if (event.type === 'assistant/message') {
+      const message = data !== null && data.message !== null && typeof data.message === 'object' ? data.message : null;
+      const text = textOf(message !== null ? message.content : undefined, false).trim();
+      if (text.length > 0) reply = text;
+      continue;
+    }
+    if (event.type === 'turn/end') {
+      const reason = data !== null && data.reason !== null && typeof data.reason === 'object' && typeof data.reason.kind === 'string' ? data.reason.kind : 'unknown';
+      if (reason === 'completed' || reason === 'max-tokens') return { status: 'done', reply, note: `turn ended ${reason}` };
+      if (reason === 'error') {
+        const failure = data.reason.error;
+        const detail = failure !== null && typeof failure === 'object' && typeof failure.message === 'string' ? failure.message : 'model request failed';
+        return { status: 'failed', reply, note: `turn errored: ${detail}` };
+      }
+      return { status: 'failed', reply, note: `turn ended ${reason}` };
+    }
+  }
+  return null;
+};
+
 export default {
   name: 'session-control',
   inject: ['tools'],
@@ -241,6 +296,73 @@ export default {
       const { controller } = runtime();
       return controller === undefined || controller === null ? null : controller;
     };
+
+    // ── delegation callbacks ────────────────────────────────────────────────
+    //
+    // Push side of `session_send(callback: true)`: while anything is pending, one
+    // pass every DELEGATION_POLL_MS turns "the target finished its turn" into "the
+    // delegator was told". Completion is decided from the TARGET's durable log
+    // (readDelegationOutcome), so the watcher holds no per-delegation state and a
+    // record left pending by a restart still settles afterwards.
+
+    /** Deliver one outcome into the delegator's own session, as a queued message. */
+    const notifyDelegator = async (controller, delegation, outcome) => {
+      const headline = outcome.status === 'done' ? '完成了你委托的任务' : '结束了你委托的任务，但没有正常完成';
+      const lines = [
+        `[委托回调] 会话 ${shortId(delegation.to)} ${headline}。`,
+        `任务：「${delegation.task.length > 0 ? clip(delegation.task, 120) : '(no task text)'}」`,
+        outcome.reply.length > 0 ? `它的答复：${clip(outcome.reply, 800)}` : '它没有留下文本答复。',
+        `状态 ${outcome.status}${outcome.note.length > 0 ? `（${outcome.note}）` : ''} · 委托 ${delegation.id} · 完整过程用 session_read，账本用 session_delegations。`,
+      ];
+      try {
+        await controller.prompt(
+          { requestId: nextRequestId(), sessionId: delegation.from, mode: 'queue', content: [{ type: 'text', text: lines.join('\n') }] },
+          callerSignal,
+        );
+      } catch (error) {
+        // The target finished; only the notice could not be delivered.
+        await noteDelegation(delegation.id, `回调未投递：${messageOf(error)}`);
+      }
+    };
+
+    /** One pass over every pending delegation. Concurrent calls share the in-flight pass. */
+    let checking = null;
+    const checkDelegations = () => {
+      if (checking !== null) return checking;
+      checking = (async () => {
+        try {
+          const controller = requireController();
+          if (controller === null) return;
+          const pending = pendingDelegations(await readState());
+          if (pending.length === 0) return;
+          for (const delegation of pending) {
+            let inspection;
+            try {
+              inspection = await controller.inspect(delegation.to, undefined);
+            } catch (error) {
+              continue; // unreadable right now (deleted, mid-write): keep it pending
+            }
+            const events = inspection !== null && inspection !== undefined && Array.isArray(inspection.events) ? inspection.events : null;
+            const outcome = readDelegationOutcome(events, delegation.baselineSeq);
+            if (outcome === null) continue;
+            await settleDelegation(delegation.id, outcome);
+            await notifyDelegator(controller, delegation, outcome);
+          }
+        } catch (error) {
+          // A watcher pass never fails a tool call or the poll loop.
+        } finally {
+          checking = null;
+        }
+      })();
+      return checking;
+    };
+
+    const timer = ctx.get('timer');
+    if (timer !== undefined && timer !== null && typeof timer.interval === 'function') {
+      const startWatch = () => timer.interval(() => { void checkDelegations(); }, DELEGATION_POLL_MS);
+      if (typeof ctx.effect === 'function') ctx.effect(startWatch, 'session-manager: delegation watcher');
+      else startWatch();
+    }
 
     const listTool = {
       name: 'session_list',
@@ -474,13 +596,14 @@ export default {
 
     const sendTool = {
       name: 'session_send',
-      description: "Deliver a prompt into another session and wake it. mode \"queue\" adds it to that session's pending inbox for after its current turn; mode \"steer\" delivers it at its nearest step boundary. The target is resumed if it was cold. This writes into the target session log exactly like a message its own user typed, so use it deliberately and say what you are relaying. It is also how you drive one branch of a fork without touching the other.",
+      description: "Deliver a prompt into another session and wake it. mode \"queue\" adds it to that session's pending inbox for after its current turn; mode \"steer\" delivers it at its nearest step boundary. The target is resumed if it was cold. This writes into the target session log exactly like a message its own user typed, so use it deliberately and say what you are relaying. It is also how you drive one branch of a fork without touching the other. Set callback=true to be TOLD when the target finishes that turn: the outcome (its reply, or why the turn ended badly) is delivered back into YOUR session as a queued message, and the delegation is recorded in a durable ledger you can read with session_delegations. The target needs no cooperation and no special preset for this — the watch is on your side.",
       parameters: {
         type: 'object',
         properties: {
           sessionId: { type: 'string', description: 'Durable target session id, from session_list.' },
           text: { type: 'string', description: 'Prompt text to deliver; must contain non-whitespace content.' },
           mode: { type: 'string', enum: ['queue', 'steer'], description: '"queue" (default) waits for the current turn; "steer" injects at the nearest step boundary.' },
+          callback: { type: 'boolean', description: 'When true, report the target\'s outcome back into this session once that turn ends. Defaults to false (fire and forget).' },
         },
         required: ['sessionId', 'text'],
       },
@@ -492,12 +615,30 @@ export default {
         const sessionId = asString(input.sessionId).trim();
         const text = asString(input.text);
         const mode = input.mode === 'steer' ? 'steer' : 'queue';
+        const callback = input.callback === true;
         if (sessionId.length === 0) return fail('sessionId is required.');
         if (text.trim().length === 0) return fail('text must contain non-whitespace content.');
         const caller = callerOf(exec);
         if (caller.id !== null && caller.id === sessionId) {
           return fail('That is the caller itself; answer the human instead of prompting yourself.');
         }
+        if (callback && caller.id === null) {
+          return fail('callback=true needs a caller session to reply to, and this call carries no caller identity.');
+        }
+
+        // Baseline BEFORE delivery: the outcome is read as "the first user message
+        // after this sequence, then the first turn end after that".
+        let baselineSeq = 0;
+        if (callback) {
+          try {
+            const inspection = await controller.inspect(sessionId, undefined);
+            const events = inspection !== null && inspection !== undefined && Array.isArray(inspection.events) ? inspection.events : [];
+            for (const event of events) if (event !== null && typeof event === 'object' && typeof event.seq === 'number' && event.seq > baselineSeq) baselineSeq = event.seq;
+          } catch (error) {
+            baselineSeq = 0;
+          }
+        }
+
         try {
           await controller.prompt(
             { requestId: nextRequestId(), sessionId, mode, content: [{ type: 'text', text }] },
@@ -511,7 +652,14 @@ export default {
           else if (code === 'session/model-unavailable') hint = ' The target has no routable model; select one for that session in the UI first.';
           return fail(`Delivery to ${sessionId} failed: ${messageOf(error)}${hint}`);
         }
-        return ok(`Accepted: one ${mode} prompt delivered to ${sessionId}. It was resumed if it was cold and processes the message in its own turn; session_list shows its running state and session_read shows what it answers.`);
+
+        if (!callback) {
+          return ok(`Accepted: one ${mode} prompt delivered to ${sessionId}. It was resumed if it was cold and processes the message in its own turn; session_list shows its running state and session_read shows what it answers.`);
+        }
+        const delegationId = nextDelegationId();
+        await addDelegation({ id: delegationId, from: caller.id, to: sessionId, task: text, mode, createdAt: Date.now(), baselineSeq, status: 'pending' });
+        void checkDelegations();
+        return ok(`Accepted: one ${mode} prompt delivered to ${sessionId}, with callback ${delegationId} registered. When that turn ends its outcome (the target's reply, or why it ended badly) is delivered into THIS session as a queued message — it will not interrupt a turn you are already running. session_delegations lists the ledger; session_queue marks the target too.`);
       },
     };
 
@@ -568,10 +716,18 @@ export default {
         }
         if (items === null) return fail('The live control stream ended before sending a baseline, so no inbox could be read. Try again.');
 
+        // A pending-or-settled delegation to this session is exactly as relevant as
+        // the inbox: it is the other half of "what did I ask it to do".
+        const ledger = (await readState()).delegations.filter((item) => item.to === sessionId);
+        const settled = ledger.filter((item) => item.status !== 'pending').length;
+        const ledgerNote = ledger.length === 0
+          ? ''
+          : `\nDelegations to ${sessionId}: ${String(ledger.length)} recorded, ${String(ledger.length - settled)} still pending, ${String(settled)} settled — session_delegations shows the replies.`;
+
         if (items.length === 0) {
-          return ok(attached
+          return ok((attached
             ? `Session ${sessionId} has a live inbox with nothing pending.`
-            : `No live inbox is registered for ${sessionId}: it has no attached agent in this process (a cold session), so nothing can be pending. session_list shows its running state; session_send with mode="queue" or "steer" creates pending messages.`);
+            : `No live inbox is registered for ${sessionId}: it has no attached agent in this process (a cold session), so nothing can be pending. session_list shows its running state; session_send with mode="queue" or "steer" creates pending messages.`) + ledgerNote);
         }
         const lines = [];
         for (let index = 0; index < items.length; index++) {
@@ -584,7 +740,61 @@ export default {
           const shown = text.length === 0 ? '(no text content)' : clip(text, maxChars);
           lines.push(`${String(index + 1)}. [${placement}] ${shown}${id.length > 0 ? `  (id ${shortId(id)})` : ''}`);
         }
-        return ok(`${String(items.length)} pending message${items.length === 1 ? '' : 's'} in ${sessionId}, in delivery order:\n${lines.join('\n')}`);
+        return ok(`${String(items.length)} pending message${items.length === 1 ? '' : 's'} in ${sessionId}, in delivery order:\n${lines.join('\n')}${ledgerNote}`);
+      },
+    };
+
+    const delegationsTool = {
+      name: 'session_delegations',
+      description: 'Read the delegation ledger: one row per session_send you made with callback=true, with its target, the task excerpt, and its state. pending = the target has not finished that turn yet; done = it finished and here is the reply it produced; failed = that turn ended aborted, blocked or errored; unknown = nothing confirmed it (for example a watcher timed out). Reading also performs a check pass, so a finished delegation appears here even if the automatic callback notice never reached you. The ledger is durable: it survives restarts, and a delegation still pending from before a restart keeps being watched.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Only delegations sent TO this session.' },
+          status: { type: 'string', enum: ['all', 'pending', 'done', 'failed', 'unknown'], description: 'Filter by state. Defaults to all.' },
+          limit: { type: 'integer', description: 'How many rows, 1-100. Defaults to 20, newest first.' },
+          dismiss: { type: 'string', description: 'Delegation id to forget: removes the ledger row. Nothing about the sessions themselves changes.' },
+        },
+      },
+      output: OUTPUT,
+      async execute(args, exec) {
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const dismiss = asString(input.dismiss).trim();
+        if (dismiss.length > 0) {
+          const before = (await readState()).delegations.length;
+          await dropDelegation(dismiss);
+          const after = (await readState()).delegations.length;
+          return ok(after < before ? `Forgot delegation ${dismiss}.` : `No delegation ${dismiss} in the ledger.`);
+        }
+
+        // A check pass first, so this read is always at least as fresh as the pull.
+        await checkDelegations();
+        const state = await readState();
+        const caller = callerOf(exec);
+        const target = asString(input.sessionId).trim();
+        const status = ['pending', 'done', 'failed', 'unknown'].includes(input.status) ? input.status : 'all';
+        const limit = clamp(asInt(input.limit, 20), 1, 100);
+        const all = Array.isArray(state.delegations) ? state.delegations : [];
+        const pendingAll = pendingDelegations(state).length;
+        const rows = all
+          .filter((item) => (target.length > 0 ? item.to === target : (caller.id === null ? true : item.from === caller.id)))
+          .filter((item) => status === 'all' || item.status === status)
+          .sort((left, right) => right.createdAt - left.createdAt)
+          .slice(0, limit);
+
+        if (rows.length === 0) {
+          const scope = target.length > 0 ? ` to ${target}` : (caller.id === null ? '' : ' from this session');
+          return ok(`No delegation${scope} matches${status === 'all' ? '' : ` (status ${status})`}. ${String(all.length)} recorded in total, ${String(pendingAll)} pending. session_send with callback=true records one.`);
+        }
+        const lines = [`${String(rows.length)} delegation(s), newest first · ${String(pendingAll)} pending in total:`];
+        for (const row of rows) {
+          const age = row.createdAt > 0 ? `, ${String(Math.max(0, Math.round((Date.now() - row.createdAt) / 1000)))}s ago` : '';
+          lines.push(`- ${row.id} · to ${row.to} · ${row.status} (${row.mode}${age}) · task: ${row.task.length > 0 ? row.task : '(no text)'}`);
+          if (row.reply.length > 0) lines.push(`    reply: ${clip(row.reply, 400)}`);
+          if (row.note.length > 0) lines.push(`    note: ${row.note}`);
+        }
+        lines.push('pending rows settle automatically once their target ends that turn; dismiss a row you are done with.');
+        return ok(lines.join('\n'));
       },
     };
 
@@ -923,6 +1133,7 @@ export default {
     ctx.tools.register(readTool);
     ctx.tools.register(sendTool);
     ctx.tools.register(queueTool);
+    ctx.tools.register(delegationsTool);
     ctx.tools.register(stopTool);
     ctx.tools.register(compactTool);
     ctx.tools.register(forkTool);
