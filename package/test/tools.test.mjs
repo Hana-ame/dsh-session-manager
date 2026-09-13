@@ -1,22 +1,25 @@
-// Smoke test for ./session-control.mjs.
+// Smoke test for ../lib/tools.mjs — the tool layer of the package.
 //
 // Runs the real plugin file against a fake Cordis context and a throwaway
-// DSH_HOME, so it exercises the note store, the transcript extractors and the
-// model-route reader without touching a live DSH process or the real ~/.dsh:
+// DSH_HOME, so it exercises the durable store, the transcript extractors, the
+// queue reader and the model-route reader without touching a live DSH process
+// or the real ~/.dsh:
 //
-//   node preset/tools/session-control.test.mjs
+//   node package/test/tools.test.mjs
 //
 // Exits non-zero when any check fails, so it works as a CI check.
 
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const dshHome = await mkdtemp(join(tmpdir(), 'dsh-session-control-test-'))
 process.env.DSH_HOME = dshHome
 
-const { default: register } = await import(new URL('./session-control.mjs', import.meta.url))
-const notePath = join(dshHome, 'session-manager', 'descriptions.json')
+const { default: register } = await import(new URL('../lib/tools.mjs', import.meta.url))
+const statePath = join(dshHome, 'session-manager', 'state.json')
+/** Read the persisted store, tolerating the file not existing yet. */
+const persisted = async () => JSON.parse(await readFile(statePath, 'utf8'))
 
 // ── fake Cordis context ────────────────────────────────────────────────────
 
@@ -37,8 +40,7 @@ const events = [
   { type: 'model/selection', seq: 9, time: 9000, data: { provider: 'p8', model: 'm8' } },
 ]
 
-const controller = {
-  list: async () => ({ items: [
+const controller = {  list: async () => ({ items: [
     { sessionId: 'session-a', updatedAt: 1700000000000, running: true, blank: false, cwd: '/tmp/repo', projections: { values: { title: 'Alpha', modelSelection: { lastUsed: { provider: 'p1', model: 'm1' }, next: { provider: 'p2', model: 'm9', reasoningEffort: 'low' } } } } },
     { sessionId: 'session-b', updatedAt: 1690000000000, running: false, blank: false, cwd: '/tmp/repo', parentSessionId: 'session-a', projections: { values: { title: 'Alpha · fork' } } },
     { sessionId: 'session-c', updatedAt: 1680000000000, running: false, blank: false, cwd: '/tmp/repo', parentSessionId: 'session-a', origin: 'subagent' },
@@ -87,8 +89,20 @@ const controller = {
   },
 }
 
+/** The host command registry: `/compact` is what session_compact drives. */
+const commands = {
+  execute: async (agent, line, attachments, signal) => {
+    calls.push(['command', agent.id, line, String(signal !== undefined && signal !== null), String(attachments.length)])
+    if (agent.id === 'session-busy') return { commandId: 'cmd-busy', result: { kind: 'error', text: 'Compaction is unavailable because this process has an active compaction, or the agent is not idle.' } }
+    if (agent.id === 'session-minimal' || agent.id === 'session-cold') return undefined
+    return { commandId: 'cmd-1', result: { kind: 'success', text: 'Compacted 12 history items (~3400 tokens).' } }
+  },
+}
+/** Everything has a live agent here except `session-cold`, which never attached. */
+const agents = { get: (id) => (id === 'session-cold' ? undefined : { id }) }
+
 register.apply({
-  get: (name) => (name === 'sessionController' ? controller : undefined),
+  get: (name) => (name === 'sessionController' ? controller : (name === 'commands' ? commands : (name === 'agents' ? agents : undefined))),
   tools: { register: (definition) => { captured[definition.name] = definition } },
 })
 
@@ -102,9 +116,19 @@ const check = (label, condition, detail) => {
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-check('nine tools registered', same(Object.keys(captured).sort(), [
-  'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
+check('ten tools registered', same(Object.keys(captured).sort(), [
+  'session_compact', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
 ]), Object.keys(captured).join(','))
+
+// The pre-0.2 note file must survive an in-place upgrade. Seed one before the
+// store has ever been read, then check it is what the tool reports.
+await mkdir(join(dshHome, 'session-manager'), { recursive: true })
+await writeFile(
+  join(dshHome, 'session-manager', 'descriptions.json'),
+  JSON.stringify({ version: 1, byId: { 'session-legacy': { description: 'migrated note', updatedAt: 1 } } }),
+)
+check('legacy notes migrate into the store',
+  (await captured.session_describe.execute({ sessionId: 'session-legacy' })).text.includes('migrated note'))
 
 // session_list
 const list = await captured.session_list.execute({ scope: 'workspace' }, callerExec)
@@ -146,11 +170,20 @@ check('half a pair is rejected with guidance', halfPair.ok === false && halfPair
 // session_describe
 const set = await captured.session_describe.execute({ sessionId: 'session-a', description: 'owns the parser work' })
 check('describe write', set.ok === true && set.text.includes('owns the parser work'), set.text)
-check('note file on disk', JSON.parse(await readFile(notePath, 'utf8')).byId['session-a'].description === 'owns the parser work')
+check('note file on disk', (await persisted()).byId['session-a'].description === 'owns the parser work')
 check('describe read', (await captured.session_describe.execute({ sessionId: 'session-a' })).text.includes('owns the parser work'))
 check('note shows in session_list', (await captured.session_list.execute({ scope: 'workspace' }, callerExec)).text.includes('note: owns the parser work'))
+check('lineage persisted by the listing',
+  (await persisted()).byId['session-b'].parentId === 'session-a'
+  && (await persisted()).byId['session-b'].kind === 'fork'
+  && (await persisted()).byId['session-c'].kind === 'subagent'
+  && (await persisted()).byId['session-a'].kind === 'top-level',
+  JSON.stringify((await persisted()).byId))
+const beforeRepeat = await readFile(statePath, 'utf8')
+await captured.session_list.execute({ scope: 'workspace' }, callerExec)
+check('an unchanged store is not rewritten', (await readFile(statePath, 'utf8')) === beforeRepeat)
 check('describe clear', (await captured.session_describe.execute({ sessionId: 'session-a', description: '' })).text.includes('Cleared'))
-check('note removed from disk', JSON.parse(await readFile(notePath, 'utf8')).byId['session-a'] === undefined)
+check('clearing a note keeps the persisted relations', (await persisted()).byId['session-a'].description === '' && (await persisted()).byId['session-a'].kind === 'top-level')
 check('unknown id warns', (await captured.session_describe.execute({ sessionId: 'session-nope', description: 'x' })).text.includes('Warning'))
 
 // session_read detail levels
@@ -199,6 +232,23 @@ check('queue requires a sessionId', (await captured.session_queue.execute({}, ca
 check('queue releases the live stream it borrowed',
   controlSignals.length >= 1 && controlSignals.every((signal) => signal.aborted === true), JSON.stringify(controlSignals.map((s) => s.aborted)))
 check('queue is read-only', calls.filter((c) => c[0] === 'prompt' || c[0] === 'cancel').length === mutationsBefore, JSON.stringify(calls))
+
+// session_compact
+const compacted = await captured.session_compact.execute({ sessionId: 'session-b' }, callerExec)
+check('compact runs /compact for the target',
+  compacted.ok === true && calls.some((c) => c[0] === 'command' && c[1] === 'session-b' && c[2] === '/compact'), compacted.text)
+check('compact reports what it folded', compacted.text.includes('Compacted 12 history items'), compacted.text)
+check('compact passes a real cancellation signal and no attachments',
+  calls.some((c) => c[0] === 'command' && c[3] === 'true' && c[4] === '0'), JSON.stringify(calls.filter((c) => c[0] === 'command')))
+check('compact surfaces a refused compaction',
+  (await captured.session_compact.execute({ sessionId: 'session-busy' }, callerExec)).text.includes('not idle'))
+check('compact explains a preset without compaction',
+  (await captured.session_compact.execute({ sessionId: 'session-minimal' }, callerExec)).text.includes('does not compose compaction'))
+check('compact explains a cold session',
+  (await captured.session_compact.execute({ sessionId: 'session-cold' }, callerExec)).text.includes('no attached agent'))
+check('compact refuses the caller itself',
+  (await captured.session_compact.execute({ sessionId: 'me' }, callerExec)).ok === false)
+check('compact requires a sessionId', (await captured.session_compact.execute({}, callerExec)).ok === false)
 
 const failures = results.filter((row) => row[0] === 'FAIL')
 for (const [status, label, detail] of results) console.log(`${status}  ${label}${detail}`)

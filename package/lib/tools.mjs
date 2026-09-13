@@ -1,19 +1,17 @@
 /**
- * Session-management tools for the `session-manager` agent preset.
+ * Session-management tools — layer ② of the `@local/dsh-session-manager` package.
  *
- * Why this file lives inside the preset directory:
- * `@deepseek-ai/dsh-agent-presets` resolves a row whose specifier starts with
- * "." against the composition's own directory, so the file travels with the
- * preset and needs no package install. A bare package name would instead
- * resolve from the harness install, which this directory cannot reach.
+ * The package holds all three layers: this file (the tools), `store.mjs` (the
+ * durable per-session records) and `client.js` (the canvas that renders them).
+ * The preset's row names this file through a relative path reaching into the
+ * package directory, because `@deepseek-ai/dsh-agent-presets` resolves a bare
+ * package name from the HARNESS install while a "."-prefixed specifier goes
+ * against the composition's own directory. One physical copy, two mount points.
  *
- * Why it is `.mjs`:
- * the preset directory carries no package.json declaring `"type": "module"`, so
- * a `.js` file would be loaded as CommonJS. A bare `import '@deepseek-ai/dsh-*'`
- * inside this file would be resolved by Node from THIS directory, not from the
- * harness — so this file imports NO packages. `node:*` builtins are the one
- * exception: they resolve as builtins anywhere, so reading and writing the
- * private note file below needs no dependency at all.
+ * Why it is `.mjs`: the file is loaded as an ES module, and `.mjs` keeps it one
+ * regardless of any package.json above it. Bare package imports would resolve
+ * from the harness install, so this file imports only `node:` builtins and its
+ * sibling `./store.mjs`.
  *
  * Plane: these tools consume the host-plane `sessionController` / `agents`
  * services and publish none of their own, so the composition row sits loose —
@@ -25,17 +23,17 @@
  * NOT mean "owned by another session" — a fork keeps a durable parent but is
  * NOT subagent-owned at runtime, which is exactly why it stays manageable here.
  *
- * Per-session notes (`session_describe`): kept in THIS plugin's own JSON file at
- * `<DSH_HOME>/session-manager/descriptions.json`. A note is deliberately not a
- * session title: it is never appended to any session log, so the session list,
- * the sidebar, the trajectory view and every other consumer of that session
- * never see it. Only this preset's tools read it. It is not a secrecy boundary —
- * the file sits in the DSH home and any process could open it — it is a
- * provenance boundary: nothing else writes or reads it.
+ * Persistence: both the describe note (`session_describe`) and the lineage each
+ * listing observes (`session_list`) go through `./store.mjs` into
+ * `<DSH_HOME>/session-manager/state.json`, which is also what the canvas reads —
+ * the tools and the canvas are two views of one record set. A note is
+ * deliberately not a session title: it is never appended to any session log, so
+ * the session list, the sidebar, the trajectory view and every other consumer of
+ * that session never see it. It is not a secrecy boundary — the file sits in the
+ * DSH home and any process could open it — it is a provenance boundary: nothing
+ * else writes it.
  */
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { NOTE_MAX_CHARS, observe, readState, setNote, statePath } from './store.mjs'
 
 let requestSeq = 0;
 
@@ -78,69 +76,23 @@ const clip = (text, cap) => (text.length > cap ? `${text.slice(0, cap)}…` : te
 /** Shorten one opaque id to its distinguishing tail. */
 const shortId = (id) => (id.length > 10 ? `…${id.slice(id.length - 8)}` : id);
 
-// ── per-session notes, owned by this plugin ─────────────────────────────────
+// ── per-session notes and observed lineage, owned by this package ───────────
+//
+// The durable layer lives in ./store.mjs so that the canvas half reads exactly
+// what these tools write. These two adapters keep the tool bodies unchanged.
 
-const NOTE_FILE_VERSION = 1;
-const NOTE_MAX_CHARS = 200;
-
-/** `<DSH_HOME>/session-manager/descriptions.json`, resolving DSH_HOME the way the harness does. */
-const notePath = () => {
-  const configured = process.env.DSH_HOME;
-  const home = typeof configured === 'string' && configured.trim().length > 0 ? configured.trim() : join(homedir(), '.dsh');
-  return join(home, 'session-manager', 'descriptions.json');
-};
-
-let noteCache = null;
-let noteChain = Promise.resolve();
-
-/** Load the note table once; a missing or corrupt file simply means "no notes". */
-const loadNotes = async () => {
-  if (noteCache !== null) return noteCache;
-  try {
-    const parsed = JSON.parse(await readFile(notePath(), 'utf8'));
-    const byId = parsed !== null && typeof parsed === 'object' && parsed.byId !== null && typeof parsed.byId === 'object' ? parsed.byId : {};
-    noteCache = { byId };
-  } catch (error) {
-    noteCache = { byId: {} };
-  }
-  return noteCache;
-};
-
-const saveNotes = async (state) => {
-  const path = notePath();
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify({ version: NOTE_FILE_VERSION, byId: state.byId }, null, 2)}\n`, 'utf8');
-};
-
-/** Serialize mutations so two concurrent tool calls cannot interleave a read-modify-write. */
-const withNotes = (operation) => {
-  const run = noteChain.then(operation);
-  noteChain = run.then(() => undefined, () => undefined);
-  return run;
-};
-
-/** The current note for one session, or null. */
+/** The current note for one session, or null when none is attached. */
 const noteOf = async (sessionId) => {
-  const state = await loadNotes();
-  const entry = state.byId[sessionId];
-  return entry !== null && entry !== undefined && typeof entry.description === 'string' ? entry.description : null;
+  const state = await readState();
+  const record = state.byId[sessionId];
+  return record !== null && record !== undefined && typeof record.description === 'string' && record.description.length > 0 ? record.description : null;
 };
 
-/** Set (non-empty) or clear (empty string) one session's note, rolling the cache back on a failed write. */
-const writeNote = (sessionId, description) => withNotes(async () => {
-  const state = await loadNotes();
-  const previous = state.byId[sessionId];
-  if (description.length === 0) delete state.byId[sessionId];
-  else state.byId[sessionId] = { description, updatedAt: Date.now() };
-  try {
-    await saveNotes(state);
-  } catch (error) {
-    if (previous === undefined) delete state.byId[sessionId];
-    else state.byId[sessionId] = previous;
-    throw error;
-  }
+/** Set (non-empty) or clear (empty string) one session's note. */
+const writeNote = async (sessionId, description) => {
+  await setNote(sessionId, description);
   return description.length === 0 ? null : description;
-});
+};
 
 // ── transcript readers ──────────────────────────────────────────────────────
 
@@ -261,6 +213,7 @@ export default {
     const runtime = () => ({
       controller: ctx.get('sessionController'),
       agents: ctx.get('agents'),
+      commands: ctx.get('commands'),
     });
 
     /** The calling agent's durable id and workspace cwd, read defensively. */
@@ -323,7 +276,8 @@ export default {
           return fail(`Could not list sessions: ${messageOf(error)}`);
         }
         const items = listed !== null && listed !== undefined && Array.isArray(listed.items) ? listed.items : [];
-        const notes = (await loadNotes()).byId;
+        const state = await readState();
+        const notes = state.byId;
 
         const rows = [];
         for (const item of items) {
@@ -389,7 +343,22 @@ export default {
               + (row.note === null ? '' : `\n    note: ${row.note}`),
             );
           }
-          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_model reads or switches its model mid-run; session_describe attaches a private note only this preset can see. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
+          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_model reads or switches its model mid-run; session_queue shows what is still waiting in its inbox; session_describe attaches a private note only this preset can see. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
+        }
+
+        // Persist the relations this listing just observed, so they outlive the
+        // sessions they describe and the canvas can render them. A failure here
+        // must not hide the listing itself.
+        try {
+          await observe(rows.map((row) => ({
+            id: row.id,
+            parentId: row.parentId,
+            kind: row.isSubagent ? 'subagent' : (row.isFork ? 'fork' : 'top-level'),
+            cwd: row.cwd,
+            title: row.title,
+          })));
+        } catch (error) {
+          lines.push(`Warning: could not persist the observed relations into ${statePath()} (${messageOf(error)}). The listing above is still current.`);
         }
         return ok(lines.join('\n'));
       },
@@ -653,6 +622,70 @@ export default {
       },
     };
 
+    const compactTool = {
+      name: 'session_compact',
+      description: 'Compact one live session\'s history right now, by running its own /compact command in that session\'s scope: the compactable span is replaced by a single summary node and the transaction is written to that session\'s log. This is the same operation the target\'s own /compact performs, so it needs a live (attached) agent that is idle — a session in the middle of a turn, one already compacting, or a cold session reports that instead of compacting. Compaction REWRITES what that session\'s model sees next, so report it plainly. The target\'s preset must compose compaction at all; a preset without it (for example `minimal`) has no /compact to run.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable session id, from session_list.' },
+        },
+        required: ['sessionId'],
+      },
+      output: OUTPUT,
+      async execute(args, exec) {
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        if (sessionId.length === 0) return fail('sessionId is required.');
+        const caller = callerOf(exec);
+        if (caller.id !== null && caller.id === sessionId) {
+          return fail('That is the caller itself; compact your own session from your own UI instead of driving yourself.');
+        }
+        const { commands, agents, controller } = runtime();
+        if (commands === undefined || commands === null || typeof commands.execute !== 'function') {
+          return fail('The command registry is unavailable in this deployment, so no session can be asked to compact.');
+        }
+
+        // A command resolves through the target's OWN scoped registrations, so the
+        // handler runs with that session's compaction engine, not this one. The
+        // registry keys scoped commands by agent, hence the bare `{ id }` agent.
+        const signal = new AbortController().signal;
+        let execution;
+        try {
+          execution = await commands.execute({ id: sessionId }, '/compact', [], signal);
+        } catch (error) {
+          return fail(`Compacting ${sessionId} failed: ${messageOf(error)}`);
+        }
+        if (execution === undefined || execution === null) {
+          let live = false;
+          if (agents !== undefined && agents !== null && typeof agents.get === 'function') {
+            try {
+              live = agents.get(sessionId) !== undefined && agents.get(sessionId) !== null;
+            } catch (error) {
+              live = false;
+            }
+          } else if (controller !== null && controller !== undefined) {
+            try {
+              const listed = await controller.list({}, undefined);
+              const items = listed !== null && listed !== undefined && Array.isArray(listed.items) ? listed.items : [];
+              live = items.some((item) => item !== null && typeof item === 'object' && item.sessionId === sessionId);
+            } catch (error) {
+              live = false;
+            }
+          }
+          return fail(live
+            ? `No /compact command is registered for ${sessionId}: its preset does not compose compaction, so there is nothing to run.`
+            : `No /compact command is registered for ${sessionId}: it has no attached agent (a cold session composes no commands). Open it once, or use session_send to wake it, and retry.`);
+        }
+        const result = execution.result;
+        const text = result !== null && result !== undefined && typeof result.text === 'string' ? result.text : '(no result text)';
+        if (result !== null && result !== undefined && result.kind === 'error') {
+          return fail(`Compact refused for ${sessionId}: ${text}`);
+        }
+        return ok(`Compact ${sessionId}: ${text} That session's history is rewritten in place — its model now sees the summary instead of the folded span.`);
+      },
+    };
+
     const forkTool = {
       name: 'session_fork',
       description: "Branch one session into an independent copy and return the new session id. The fork is seeded with the source log up to the end of a completed turn (the latest one, or the first turn ending at or after atSeq), inherits the source's agent preset and working directory, and from then on has its own log and its own agent. Both sides are then managed separately with session_read / session_send / session_stop; the source is untouched. Use this to try two directions from one shared context and compare what each branch concludes.",
@@ -752,7 +785,7 @@ export default {
           const stored = await writeNote(sessionId, description);
           return ok(stored === null
             ? `Cleared the note for ${sessionId}.${unknown}`
-            : `Note for ${sessionId} set to: ${stored}${unknown}`);
+            : `Note for ${sessionId} set to: ${stored}${unknown} (persisted in ${statePath()})`);
         } catch (error) {
           return fail(`Writing the note failed: ${messageOf(error)}`);
         }
@@ -891,6 +924,7 @@ export default {
     ctx.tools.register(sendTool);
     ctx.tools.register(queueTool);
     ctx.tools.register(stopTool);
+    ctx.tools.register(compactTool);
     ctx.tools.register(forkTool);
     ctx.tools.register(describeTool);
   },

@@ -1,18 +1,23 @@
-// Session Canvas — CLIENT half, as a real client plugin bundle.
+// Session Canvas — CLIENT half (③) of the `@local/dsh-session-manager` package.
 //
 // This file is a CLASSIC SCRIPT, not an ES module: it registers a factory with
 // the harness's browser module loader, exactly like every shipped client bundle
 // (`lib/client.js` of `@deepseek-ai/dsh-client-ui-*`). It is therefore written by
-// hand rather than produced by a bundler — it uses only `React.createElement`,
-// requires nothing but react, and pulls its data from the existing `session`
-// Remote namespace.
+// hand rather than produced by a bundler. It requires nothing but `react`, and
+// the envelope id MUST be the package name — that is how the client module
+// system matches a loaded factory to the graph row that asked for it.
+//
+// It reads two things: the live session list through the existing `session`
+// Remote namespace, and the persisted records (②'s output) through the one
+// same-origin route the package's host half serves. The tools and this canvas
+// are therefore two views of the same record set.
 //
 // Note the shim: `window.__ModuleLoader__.load({ id, factory })`, where the
 // factory returns a module whose named exports are the cordis plugin parts
 // (`apply`, and optionally `inject`). A missing `client.js.map` is fine — the
 // client module system treats source maps as optional.
 window.__ModuleLoader__.load({
-	id: '@local/dsh-session-canvas',
+	id: '@local/dsh-session-manager',
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
@@ -22,18 +27,25 @@ window.__ModuleLoader__.load({
 		const CANVAS_W = 1120;
 		const CANVAS_H = 600;
 		const NODE_W = 176;
-		const NODE_H = 58;
+		const NODE_H = 72;
 		const COL_GAP = 30;
 		const ROW_GAP = 104;
 		const GROUP_PAD = 24;
 		const GROUP_GAP = 44;
 		const GROUP_LABEL_H = 24;
 		const REFRESH_MS = 4000;
+		/** The one same-origin route the package's host half serves (see lib/index.js). */
+		const STATE_URL = '/session-manager/state';
 		const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans SC", sans-serif';
 
-		/** Normalize one Remote `SessionSummary` into the flat record the layout wants. */
-		const normalize = (item) => {
-			const parentId = typeof item.parentSessionId === 'string' ? item.parentSessionId : null;
+		/**
+		* Normalize one Remote `SessionSummary` into the flat record the layout
+		* wants, enriched with the persisted record the tools wrote for that session
+		* (its describe note and the lineage last observed for it). A persisted
+		* relation only fills a gap: the live session log stays the first source.
+		*/
+		const normalize = (item, stored) => {
+			const liveParent = typeof item.parentSessionId === 'string' ? item.parentSessionId : null;
 			const isSubagent = item.origin === 'subagent';
 			let title = null;
 			const projections = item.projections;
@@ -41,15 +53,42 @@ window.__ModuleLoader__.load({
 				const values = projections.values;
 				if (values !== null && values !== undefined && typeof values === 'object' && typeof values.title === 'string' && values.title.length > 0) title = values.title;
 			}
+			const parentId = liveParent !== null ? liveParent : (stored !== null && stored !== undefined && typeof stored.parentId === 'string' ? stored.parentId : null);
+			const kind = isSubagent ? 'subagent' : (parentId !== null ? 'fork' : 'top-level');
 			return {
 				id: String(item.sessionId),
 				title: title,
-				cwd: typeof item.cwd === 'string' ? item.cwd : null,
+				cwd: typeof item.cwd === 'string' ? item.cwd : (stored !== null && stored !== undefined && typeof stored.cwd === 'string' ? stored.cwd : null),
 				running: item.running === true,
-				isSubagent: isSubagent,
-				isFork: !isSubagent && parentId !== null,
+				isSubagent: kind === 'subagent',
+				isFork: kind === 'fork',
 				parentId: parentId,
 				updatedAt: typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt) ? item.updatedAt : 0,
+				note: stored !== null && stored !== undefined && typeof stored.description === 'string' && stored.description.length > 0 ? stored.description : null,
+				storedOnly: false,
+			};
+		};
+
+		/**
+		* One persisted record for a session the live list no longer carries — an
+		* archived or deleted session the manager still remembers. It is drawn dimmed
+		* so a remembered session never reads as a live one.
+		*/
+		const normalizeStored = (id, stored) => {
+			const parentId = typeof stored.parentId === 'string' ? stored.parentId : null;
+			const kind = stored.kind === 'subagent' ? 'subagent' : (stored.kind === 'fork' || parentId !== null ? 'fork' : 'top-level');
+			const seen = typeof stored.firstSeenAt === 'number' && Number.isFinite(stored.firstSeenAt) ? stored.firstSeenAt : 0;
+			return {
+				id: String(id),
+				title: typeof stored.title === 'string' && stored.title.length > 0 ? stored.title : null,
+				cwd: typeof stored.cwd === 'string' ? stored.cwd : null,
+				running: false,
+				isSubagent: kind === 'subagent',
+				isFork: kind === 'fork',
+				parentId: kind === 'top-level' ? null : parentId,
+				updatedAt: typeof stored.updatedAt === 'number' && Number.isFinite(stored.updatedAt) && stored.updatedAt > 0 ? stored.updatedAt : seen,
+				note: typeof stored.description === 'string' && stored.description.length > 0 ? stored.description : null,
+				storedOnly: true,
 			};
 		};
 
@@ -290,23 +329,31 @@ window.__ModuleLoader__.load({
 				const isCurrent = currentId !== null && currentId !== undefined && session.id === currentId;
 				const isSelected = selectedId !== null && selectedId !== undefined && session.id === selectedId;
 				const running = session.running === true;
+				const stale = session.storedOnly === true;
 				roundRect(context, node.x, node.y, node.w, node.h, 12);
-				context.fillStyle = session.isSubagent ? '#1a2231' : (session.isFork ? '#1b2333' : '#151c27');
+				context.fillStyle = stale ? '#141821' : (session.isSubagent ? '#1a2231' : (session.isFork ? '#1b2333' : '#151c27'));
 				context.fill();
 				context.lineWidth = isSelected ? 2.4 : (isCurrent ? 2.2 : 1.4);
-				context.strokeStyle = isCurrent ? '#ffd166' : (isSelected ? '#4da3ff' : (running ? '#3ddc84' : '#2a3346'));
+				context.strokeStyle = isCurrent ? '#ffd166' : (isSelected ? '#4da3ff' : (stale ? '#3a4152' : (running ? '#3ddc84' : '#2a3346')));
+				if (stale) context.setLineDash([4, 3]);
 				context.stroke();
+				context.setLineDash([]);
 				context.beginPath();
 				context.arc(node.x + 16, node.y + 19, 4, 0, Math.PI * 2);
-				context.fillStyle = running ? '#3ddc84' : '#59627a';
+				context.fillStyle = stale ? '#3a4152' : (running ? '#3ddc84' : '#59627a');
 				context.fill();
 				context.font = '600 13px ' + FONT;
-				context.fillStyle = '#e7ebf3';
+				context.fillStyle = stale ? '#98a1b5' : '#e7ebf3';
 				context.fillText(fitText(context, titleOf(session), node.w - (isCurrent ? 74 : 34)), node.x + 28, node.y + 24);
 				context.font = '400 11px ' + FONT;
 				context.fillStyle = '#79829a';
-				const meta = shortId(session.id) + ' · ' + lineageOf(session) + (running ? ' · running' : '');
+				const meta = shortId(session.id) + ' · ' + lineageOf(session) + (stale ? ' · remembered' : (running ? ' · running' : ''));
 				context.fillText(fitText(context, meta, node.w - 28), node.x + 14, node.y + 44);
+				if (session.note !== null) {
+					context.font = '400 11px ' + FONT;
+					context.fillStyle = '#c8a95f';
+					context.fillText(fitText(context, '✎ ' + session.note, node.w - 28), node.x + 14, node.y + 62);
+				}
 				if (isCurrent) {
 					context.font = '600 10px ' + FONT;
 					context.fillStyle = '#ffd166';
@@ -324,6 +371,8 @@ window.__ModuleLoader__.load({
 				{ color: '#4da3ff', label: 'selected' },
 				{ color: '#1a2231', label: 'subagent child' },
 				{ color: '#1b2333', label: 'fork' },
+				{ color: '#141821', label: 'remembered (store only)' },
+				{ color: '#c8a95f', label: 'private note' },
 			];
 			let cursorX = 20;
 			for (const item of legend) {
@@ -403,6 +452,21 @@ window.__ModuleLoader__.load({
 				return items;
 			};
 
+			/**
+			* One read of the durable store the tools write, over the route the
+			* package's host half serves. Same origin, so the page's own credentials
+			* come along. A failure here degrades the canvas to live-only, never to a
+			* blank one.
+			*/
+			const fetchStored = async () => {
+				if (typeof fetch !== 'function') throw new Error('this page has no fetch');
+				const reply = await fetch(STATE_URL, { credentials: 'same-origin', headers: { accept: 'application/json' } });
+				if (reply === null || reply === undefined || reply.ok !== true) throw new Error(`the store route answered ${String(reply === null || reply === undefined ? 'nothing' : reply.status)}`);
+				const body = await reply.json();
+				const byId = body !== null && body !== undefined && typeof body === 'object' && body.byId !== null && typeof body.byId === 'object' ? body.byId : {};
+				return byId;
+			};
+
 			function SessionCanvas(props) {
 				const currentId = useCurrentId(props.useSessions);
 				// Standard prop of the `shell.overlay` seat: the Workspace projection.
@@ -417,6 +481,14 @@ window.__ModuleLoader__.load({
 				const statusPair = React.useState('loading');
 				const status = statusPair[0];
 				const setStatus = statusPair[1];
+				// Sessions the durable store still remembers but the live list no
+				// longer carries (archived or deleted): drawn dimmed, never as live.
+				const rememberedPair = React.useState([]);
+				const remembered = rememberedPair[0];
+				const setRemembered = rememberedPair[1];
+				const storePair = React.useState(null);
+				const storeIssue = storePair[0];
+				const setStoreIssue = storePair[1];
 				const selectedPair = React.useState(null);
 				const selectedId = selectedPair[0];
 				const setSelectedId = selectedPair[1];
@@ -431,8 +503,23 @@ window.__ModuleLoader__.load({
 				const viewKeyHolder = React.useState(() => ({ key: null }))[0];
 
 				const refresh = () => {
-					fetchSessions().then((items) => {
-						setData(items.map(normalize));
+					// Both halves matter and fail independently: the live list is the
+					// graph, the store is what the manager persisted about it.
+					Promise.all([fetchSessions(), fetchStored().then((byId) => byId, (error) => error)]).then((pair) => {
+						const items = pair[0];
+						const stored = pair[1];
+						const failed = stored instanceof Error;
+						const byId = failed ? {} : stored;
+						const live = items.map((item) => normalize(item, byId[String(item.sessionId)]));
+						const liveIds = new Set(live.map((session) => session.id));
+						const orphans = [];
+						for (const id of Object.keys(byId)) {
+							if (liveIds.has(id)) continue;
+							orphans.push(normalizeStored(id, byId[id]));
+						}
+						setData(live);
+						setRemembered(orphans);
+						setStoreIssue(failed ? (typeof stored.message === 'string' ? stored.message : String(stored)) : null);
 						setStatus('ready');
 					}).catch((error) => {
 						setStatus('error: ' + (error !== null && error !== undefined && typeof error.message === 'string' ? error.message : String(error)));
@@ -449,7 +536,12 @@ window.__ModuleLoader__.load({
 				// the current Session is drawn, so one process serving several projects
 				// never mixes their graphs.
 				const workspace = workspaceOf(workspaceItems, currentId, data);
-				const visible = data === null ? [] : scopeToWorkspace(data, workspace, currentId);
+				// The graph is the live list PLUS everything the store still remembers,
+				// so a relation the manager persisted never disappears just because the
+				// session behind it was archived.
+				const pool = data === null ? [] : data.concat(remembered);
+				const visible = data === null ? [] : scopeToWorkspace(pool, workspace, currentId);
+				const rememberedShown = visible.filter((session) => session.storedOnly === true).length;
 				const layout = data === null ? null : buildLayout(visible);
 				const workspaceLabel = workspace === null
 					? '（未识别）'
@@ -503,7 +595,10 @@ window.__ModuleLoader__.load({
 					React.createElement('div', null,
 						React.createElement('div', { style: { fontSize: '14px', fontWeight: 600, color: '#e7ebf3' } }, 'Session Canvas'),
 						React.createElement('div', { style: { fontSize: '11.5px', color: '#7e879c', marginTop: '3px' } },
-							'当前工作区 ' + workspaceLabel + ' · ' + status + ' · 会话 ' + String(visible.length))
+							'当前工作区 ' + workspaceLabel + ' · ' + status
+							+ ' · 会话 ' + String(visible.length)
+							+ (rememberedShown === 0 ? '' : `（其中 ${String(rememberedShown)} 个来自持久记录）`)
+							+ (storeIssue === null ? '' : ` · 持久记录不可读：${storeIssue}`))
 					),
 					React.createElement('button', { type: 'button', 'aria-label': '关闭', title: '关闭', onClick: () => setOpen(false), style: closeStyle }, '✕')
 				);
@@ -535,8 +630,9 @@ window.__ModuleLoader__.load({
 							React.createElement('span', { style: { color: '#e7ebf3', fontWeight: 600 } }, titleOf(selected)),
 							React.createElement('span', { style: mutedStyle }, shortId(selected.id)),
 							React.createElement('span', { style: mutedStyle }, 'cwd ' + (selected.cwd === null ? '(none)' : selected.cwd)),
-							React.createElement('span', { style: mutedStyle }, selected.running ? 'running' : 'idle'),
-							React.createElement('span', { style: mutedStyle }, selected.isSubagent ? 'subagent child of ' + String(selected.parentId) : (selected.isFork ? 'fork of ' + String(selected.parentId) : 'top-level session'))
+							React.createElement('span', { style: mutedStyle }, selected.storedOnly === true ? 'remembered (not live)' : (selected.running ? 'running' : 'idle')),
+							React.createElement('span', { style: mutedStyle }, selected.isSubagent ? 'subagent child of ' + String(selected.parentId) : (selected.isFork ? 'fork of ' + String(selected.parentId) : 'top-level session')),
+							selected.note === null ? null : React.createElement('span', { style: { color: '#c8a95f' } }, '✎ ' + selected.note)
 						)
 				);
 

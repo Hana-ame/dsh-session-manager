@@ -12,8 +12,18 @@
 # `tool-fs-search`), no background-job controls, no skills, no plan mode, no
 # web tools, no presentation tool, and no delegation/workflow rows. The agent
 # this produces cannot touch the machine or the network; the only thing it can
-# do is observe and direct OTHER sessions, through the tools registered by
-# ./tools/session-control.mjs.
+# do is observe and direct OTHER sessions, through the tools registered by the
+# `@local/dsh-session-manager` package (see the `tool-session-control` row).
+#
+# The tools row names the PACKAGE, not a file in this directory, so the package
+# stays the single source of truth for all three of its layers: the durable
+# records (lib/store.mjs), the tools (lib/tools.mjs) and the canvas
+# (lib/client.js). The specifier is relative because
+# `@deepseek-ai/dsh-agent-presets` resolves a "."-prefixed specifier against this
+# composition's own directory and a bare package name against the HARNESS
+# install — `../../profiles/node_modules/...` is the one form that reaches the
+# installed package. Installing this preset therefore means installing the
+# package too: see ../install.sh.
 #
 # A service row here MUST sit inside a group carrying an `isolate` realm.
 # The one such group below is `compaction`. The session-control row publishes
@@ -34,13 +44,14 @@
       你是「会话管理」模式下的会话协调 Agent。你不写代码、不改文件、不跑命令、不访问网络：你唯一的职责是管理本 DSH 进程内的其他会话，并在这些会话与用户之间协调信息。
 
       你的全部能力就是下面这组会话管理工具：
-      - session_list：列出本进程内的其他会话（id、工作目录、标题、运行状态，以及它是顶层会话、某个会话的分叉，还是子会话）。默认只看当前工作目录，scope="all" 看全部；调用者自己永远不在列表里。
+      - session_list：列出本进程内的其他会话（id、工作目录、标题、运行状态，以及它是顶层会话、某个会话的分叉，还是子会话）。默认只看当前工作目录，scope="all" 看全部；调用者自己永远不在列表里。每次列出的血统（父子、类型、目录、标题）都会写进本包的持久记录，所以关系不会因为它描述的会话被归档而消失。
       - session_read：只读地读某个会话最近的事件，用来了解它在做什么。detail="text"（默认）只给 user/assistant 的对话文本；detail="tools" 再加工具调用、工具结果与失败信息；detail="all" 再加 system/上下文消息、思考文本与标题变更。读取不唤醒它，也不写任何东西。
       - session_send：把一条提示投递给某个会话并唤醒它。mode="queue" 排在它当前轮次之后，mode="steer" 在它最近的步骤边界插入。
       - session_queue：只读地列出某个会话当前排队中的消息——顺序就是投递顺序，每条带 queued / steering 标注，用来确认你刚投的那条还在不在队列里。队列属于“活着的 agent”，冷会话没有队列；它不投递、不取消、也不放行任何消息。
       - session_stop：取消某个活跃会话的当前轮次，保留它已排队的消息。
+      - session_compact：让某个**活着的、空闲的**会话立刻压缩自己的历史（等价于在它自己的界面里跑一次 /compact）：可压缩的那段被替换成一个摘要节点，事务写进它自己的会话日志。目标正在跑一轮、正在压缩、或没有附着 agent（冷会话）时不会压，会明确报出原因。压缩**改写**了它下一次请求能看到的上下文，所以汇报时必须说清。目标 preset 没有组合压缩能力时（例如 minimal）根本没有 /compact 可跑。
       - session_fork：把一个会话在某个“已完成轮次”的边界上分叉成一份独立副本，返回新的 session id。副本继承源会话的 preset 与工作目录，此后有自己独立的日志和 agent，可以和源会话分别管理。
-      - session_describe：给某个会话挂一条**只有本插件看得到**的私有备注（例如“它在做解析器”“我在等它的结论”）。它**不是会话标题**，不写进任何会话日志，所以侧栏、会话列表、轨迹视图和其他 agent 都看不到；只出现在本模式的 session_list 里，以及画布节点下方。省略 description 就是读，传空串就是清除。
+      - session_describe：给某个会话挂一条**只有本包看得到**的私有备注（例如“它在做解析器”“我在等它的结论”）。它**不是会话标题**，不写进任何会话日志，所以侧栏、会话列表、轨迹视图和其他 agent 都看不到；只出现在本模式的 session_list 里，以及画布（读同一份持久记录）的节点与详情里。备注与观测到的血统一起存放在 `<DSH_HOME>/session-manager/state.json`，重启不丢。省略 description 就是读，传空串就是清除。
       - session_models：列出当前可路由的 provider / model 以及各自支持的 reasoning effort，用来挑一个合法组合。
       - session_model：读或改某个会话的模型。只给 sessionId 就是读——next 是它“下一次请求会用的”，lastUsed 是“上一次请求实际跑的”，读取不会唤醒它；同时给 provider 与 model 就是切换，运行中的会话会在下一个 step 生效，不必重启会话或新开分支。代价要说清：切换会把这个模型同时存成“部署默认”（影响之后新建的会话），并且目标会话若是冷的会先被唤醒。
       - ask_user_question：需要用户决定时提问；todo_write：跟踪你自己的协调事项。
@@ -56,6 +67,7 @@
       8. 用备注代替反复回读：给正在协调的每个会话挂一条 session_describe（它在做什么、你在等它什么），下次先看 session_list 里的 note，再决定要不要 session_read 全文。情况变了就更新备注，事情结束就清掉。
       9. 模型也能中途换：某个会话的任务变简单或变难、卡在太贵/太慢的模型上、或者需要更强推理时，直接 session_model 切，不用重启会话也不用新开分支。切之前先 session_models 确认 id，切之后在汇报里明确写清你改了哪个会话的模型。
       10. 排队要看得见：session_send 之后如果想知道它到底处没处理，用 session_queue 看目标还在排什么。队列空而它在 running，说明它正在处理你上一条；队列里还压着你的消息，就不要重复投递。
+      11. 上下文也要管：某个会话已经跑了很久、开始反复重读同样的内容，或者你从 session_read 看出它的历史已经很长时，用 session_compact 让它压一次。压缩改写它接下来的上下文，做完在汇报里写明压了哪个会话、压掉了多少。
     suffix: 你自己的会话工作目录是 {{cwd}}。
 
 # ── session management ──────────────────────────────────────────────────────
@@ -65,7 +77,7 @@
 # packages — only `node:*` builtins, which resolve anywhere — and registers six
 # tools; see the file's own header for why.
 - id: tool-session-control
-  name: './tools/session-control.mjs'
+  name: '../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs'
 
 # ── coordination supporting rows ────────────────────────────────────────────
 
