@@ -158,6 +158,26 @@ check('twelve tools registered', same(Object.keys(captured).sort(), [
   'session_compact', 'session_create', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
 ]), Object.keys(captured).join(','))
 
+// Every tool here registers through the RAW `ctx.tools.register()` path rather
+// than `defineTool()`, so `parameters` reaches the model API verbatim — the
+// registry validates only the OUTPUT schema. Providers require an object root,
+// and a declared-but-empty `{}` is not one: it is sent as `type: null` and the
+// whole request fails with
+//   Invalid schema for function '<name>': schema must be a JSON Schema of
+//   'type: "object"', got 'type: null'.
+// A tool with no arguments still has to say so. Assert the root explicitly for
+// every registered tool, so an argument-less tool added later cannot silently
+// reintroduce the failure.
+for (const [name, tool] of Object.entries(captured)) {
+  const schema = tool.parameters
+  check(`${name} declares an object-rooted parameter schema`,
+    schema !== null && typeof schema === 'object' && schema.type === 'object',
+    JSON.stringify(schema))
+}
+check('an argument-less tool declares an empty, not absent, object root',
+  same(captured.session_models.parameters, { type: 'object', properties: {} }),
+  JSON.stringify(captured.session_models.parameters))
+
 // The pre-0.2 note file must survive an in-place upgrade. Seed one before the
 // store has ever been read, then check it is what the tool reports.
 await mkdir(join(dshHome, 'session-manager'), { recursive: true })

@@ -1110,7 +1110,15 @@ export default {
     const modelsTool = {
       name: 'session_models',
       description: 'List every model route this deployment can currently reach, grouped by provider, with each model\'s reasoning efforts. Use it to pick a valid provider/model pair for session_model. The catalog is advisory — membership never changes routing — and it reports providers whose discovery failed.',
-      parameters: {},
+      // Registered through the RAW `ctx.tools.register()` path, which forwards
+      // `parameters` to the model API verbatim (it validates only the OUTPUT
+      // schema). An empty `{}` is not a valid function schema: providers reject
+      // it with `type must be "object", got "type: null"`. This tool takes no
+      // arguments, so declare the empty object root explicitly.
+      parameters: {
+        type: 'object',
+        properties: {},
+      },
       output: OUTPUT,
       async execute() {
         const controller = requireController();
