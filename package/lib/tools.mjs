@@ -33,12 +33,24 @@
  * DSH home and any process could open it — it is a provenance boundary: nothing
  * else writes it.
  */
-import { addDelegation, dropDelegation, noteDelegation, observe, pendingDelegations, readState, settleDelegation, setNote, statePath, NOTE_MAX_CHARS } from './store.mjs'
+import { addDelegation, claimDelegationNotice, dropDelegation, markDelegationNotified, noteDelegation, releaseDelegationNotice, observe, pendingDelegations, readState, settleDelegation, setNote, setTitle, statePath, undeliveredDelegations, NOTE_MAX_CHARS } from './store.mjs'
 
 let requestSeq = 0;
 
 /** Mint one prompt correlation id for `sessionController.prompt`. */
 const nextRequestId = () => `preset-session-${Date.now().toString(36)}-${(++requestSeq).toString(36)}`;
+
+/**
+ * The correlation id of a delegation's callback notice.
+ *
+ * Deliberately DERIVED from the delegation id instead of minted fresh: the
+ * session controller dedupes a prompt whose `requestId` already appears in the
+ * target's inbox or durable log (`hasPromptRequest`), so re-enqueuing the same
+ * notice after a crash — or from a second watcher instance — is a no-op rather
+ * than a second delivery. A fresh id per attempt, which is what `nextRequestId`
+ * gives, defeats exactly that protection.
+ */
+const noticeRequestId = (delegationId) => `preset-delegation-${delegationId}`;
 
 let delegationSeq = 0;
 
@@ -81,6 +93,20 @@ const asInt = (value, fallback) => (typeof value === 'number' && Number.isFinite
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 /** Clip one display string, marking the elision. */
 const clip = (text, cap) => (text.length > cap ? `${text.slice(0, cap)}…` : text);
+
+// ── session_read caps ───────────────────────────────────────────────────────
+//
+// The caller chooses the size of what it reads back. `maxChars` is the per-event
+// cap, `totalChars` is the whole-response budget; both default to the historic
+// behaviour (1200 per event, 12000 total) so an unqualified call costs exactly
+// what it used to, but either may be raised freely to read a long delivery in a
+// single call. The absolute ceilings only stop a typo becoming a multi-megabyte
+// response.
+
+const READ_DEFAULT_MAX_CHARS = 1200;
+const READ_DEFAULT_TOTAL_CHARS = 12000;
+const READ_MAX_CHARS_LIMIT = 500000;
+const READ_TOTAL_CHARS_LIMIT = 5000000;
 /** Shorten one opaque id to its distinguishing tail. */
 const shortId = (id) => (id.length > 10 ? `…${id.slice(id.length - 8)}` : id);
 
@@ -122,6 +148,27 @@ const titleOf = async (controller, sessionId) => {
   }
   return null;
 };
+
+/**
+ * Strip what a session title may never carry, mirroring the host's own
+ * normalization (`@deepseek-ai/dsh-session-title` `cleanTitleText`).
+ *
+ * This is a PRE-FLIGHT check, not the authority: the host normalizes and
+ * truncates again in `SessionTitleService.rename`, and its answer is what the
+ * tool reports. Rejecting here only keeps an obviously empty title (controls
+ * and zero-width marks only, say) from becoming a round trip whose only result
+ * would be `session/title-invalid`. The host strips OSC/CSI/ESC sequences and
+ * directional controls for the same reason a displayed title must not be able to
+ * lie about its own text.
+ */
+const visibleTitleOf = (input) => input
+  .replace(/(?:\u001B\]|\u009D)(?:(?!\u0007|\u001B\\)[\s\S])*(?:\u0007|\u001B\\|$)/gu, '')
+  .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/gu, '')
+  .replace(/\u001B[@-_]/gu, '')
+  .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, '')
+  .replace(/[\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/gu, '')
+  .replace(/\s+/gu, ' ')
+  .trim();
 
 /** Normalize one { provider, model, reasoningEffort? } selection, or null. */
 const selectionOf = (value) => {
@@ -301,32 +348,98 @@ export default {
       return controller === undefined || controller === null ? null : controller;
     };
 
+    const requireWorkspaces = () => {
+      const { workspaces } = runtime();
+      return workspaces === undefined || workspaces === null ? null : workspaces;
+    };
+
     // ── delegation callbacks ────────────────────────────────────────────────
     //
-    // Push side of `session_send(callback: true)`: while anything is pending, one
-    // pass every DELEGATION_POLL_MS turns "the target finished its turn" into "the
-    // delegator was told". Completion is decided from the TARGET's durable log
-    // (readDelegationOutcome), so the watcher holds no per-delegation state and a
-    // record left pending by a restart still settles afterwards.
+    // Push side of `session_send(callback: true)`: one pass turns "the target
+    // finished its turn" into "the delegator was told". Completion is decided
+    // from the TARGET's durable log (readDelegationOutcome), so the watcher holds
+    // no per-delegation state and a record left pending by a restart still
+    // settles afterwards.
+    //
+    // Delivery is idempotent, and that is a property of the LEDGER, not of this
+    // pass. Two rules enforce it:
+    //
+    //   1. A pass only ever notifies a row it WON the atomic claim for
+    //      (`claimDelegationNotice`). Two watcher passes — the timer's and a
+    //      `session_delegations` read's, or the same pass on two module
+    //      instances — can both see one settled row, but only one gets a
+    //      non-null claim. Notifying off `settleDelegation` alone, as this code
+    //      once did, ignored which caller had actually settled the row, so every
+    //      pass that observed a settled delegation re-sent its notice.
+    //   2. `notifiedAt` is persisted AFTER the prompt is accepted, and the
+    //      notice's `requestId` is derived from the delegation id, so the crash
+    //      window between settling and sending is safe in both directions: the
+    //      next start retries (no loss), and the controller dedupes that retry
+    //      (`hasPromptRequest`, no duplicate) even if the first send did land.
+    //
+    // A dismissed row can never be notified: `dismiss` removes it, and nothing
+    // can claim a row it cannot find.
 
     /** Deliver one outcome into the delegator's own session, as a queued message. */
     const notifyDelegator = async (controller, delegation, outcome) => {
+      // Re-check the row immediately before sending: a `dismiss` that lands in
+      // the gap between the claim and this prompt must suppress the notice, not
+      // let a row the user already forgot still arrive.
+      const latest = await readState();
+      const row = latest.delegations.find((item) => item.id === delegation.id);
+      if (row === undefined || row.notifiedAt > 0) {
+        releaseDelegationNotice(delegation.id);
+        return false;
+      }
       const headline = outcome.status === 'done' ? '完成了你委托的任务' : '结束了你委托的任务，但没有正常完成';
+      // Deliberately a SHORT acknowledgement, never the reply body: the reply can
+      // run to thousands of characters, and a queued notice that carries it both
+      // bloats the delegator's context and arrives truncated anyway. The full
+      // text is durable in the target's session log, so the notice only says
+      // where to read it.
       const lines = [
-        `[委托回调] 会话 ${shortId(delegation.to)} ${headline}。`,
-        `任务：「${delegation.task.length > 0 ? clip(delegation.task, 120) : '(no task text)'}」`,
-        outcome.reply.length > 0 ? `它的答复：${clip(outcome.reply, 800)}` : '它没有留下文本答复。',
-        `状态 ${outcome.status}${outcome.note.length > 0 ? `（${outcome.note}）` : ''} · 委托 ${delegation.id} · 完整过程用 session_read，账本用 session_delegations。`,
+        `[callback] 会话 ${shortId(delegation.to)} ${headline}。`,
+        `task：「${delegation.task.length > 0 ? clip(delegation.task, 120) : '(no task text)'}」`,
+        outcome.reply.length > 0
+          ? `它留下了 ${String(outcome.reply.length)} 字符的答复（未随 callback 携带）。`
+          : '它没有留下文本答复。',
+        `状态 ${outcome.status}${outcome.note.length > 0 ? `（${outcome.note}）` : ''} · delegation ${delegation.id} · 请用 session_read(sessionId="${delegation.to}") 查看完整交付，delegation ledger 用 session_delegations。`,
       ];
       try {
         await controller.prompt(
-          { requestId: nextRequestId(), sessionId: delegation.from, mode: 'queue', content: [{ type: 'text', text: lines.join('\n') }] },
+          { requestId: noticeRequestId(delegation.id), sessionId: delegation.from, mode: 'queue', content: [{ type: 'text', text: lines.join('\n') }] },
           callerSignal,
         );
+        // Durable "delivered": written only after the controller ACCEPTED the
+        // notice, so a restart cannot re-enqueue it and a failed attempt is not
+        // silently treated as done. A row dismissed while the prompt was in
+        // flight simply leaves nothing to mark.
+        await markDelegationNotified(delegation.id);
+        return true;
       } catch (error) {
-        // The target finished; only the notice could not be delivered.
-        await noteDelegation(delegation.id, `回调未投递：${messageOf(error)}`);
+        // The target finished; only the notice could not be delivered. Leave
+        // `notifiedAt` unset (the attempt cap bounds retries) and always free the
+        // in-flight claim, even if recording the reason itself fails.
+        try {
+          await noteDelegation(delegation.id, `回调未投递：${messageOf(error)}`);
+        } finally {
+          releaseDelegationNotice(delegation.id);
+        }
+        return false;
       }
+    };
+
+    /**
+     * Deliver one settled row, at most once, to whichever pass wins its claim.
+     * `outcome` is the text to announce; it is the freshly-read outcome when this
+     * pass settled the row, and the recorded row itself when this pass is only
+     * recovering a notice that an earlier pass failed to send. Returns true when
+     * a notice was actually handed to the delegator.
+     */
+    const deliverSettled = async (controller, delegation, outcome) => {
+      const claimed = await claimDelegationNotice(delegation.id);
+      if (claimed === null) return false; // another pass already claimed or delivered it
+      return notifyDelegator(controller, claimed, outcome);
     };
 
     /** One pass over every pending delegation. Concurrent calls share the in-flight pass. */
@@ -337,6 +450,17 @@ export default {
         try {
           const controller = requireController();
           if (controller === null) return;
+          const state = await readState();
+          // Deliver anything already settled but not yet announced. This is what
+          // makes a notice survive the gap between settling a row and sending its
+          // notice (a process exit in between, or a delivery that threw).
+          for (const delegation of undeliveredDelegations(state)) {
+            await deliverSettled(controller, delegation, {
+              status: delegation.status,
+              reply: delegation.reply,
+              note: delegation.note,
+            });
+          }
           const pending = pendingDelegations(await readState());
           if (pending.length === 0) return;
           for (const delegation of pending) {
@@ -349,8 +473,11 @@ export default {
             const events = inspection !== null && inspection !== undefined && Array.isArray(inspection.events) ? inspection.events : null;
             const outcome = readDelegationOutcome(events, delegation.baselineSeq);
             if (outcome === null) continue;
-            await settleDelegation(delegation.id, outcome);
-            await notifyDelegator(controller, delegation, outcome);
+            // Settle first, then claim+deliver. The settle is itself atomic and
+            // only one pass can win it, and the claim gates the send.
+            const settled = await settleDelegation(delegation.id, outcome);
+            if (settled === null) continue; // another pass settled (or dismissed) it first
+            await deliverSettled(controller, settled, outcome);
           }
         } catch (error) {
           // A watcher pass never fails a tool call or the poll loop.
@@ -469,7 +596,7 @@ export default {
               + (row.note === null ? '' : `\n    note: ${row.note}`),
             );
           }
-          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_model reads or switches its model mid-run; session_queue shows what is still waiting in its inbox; session_describe attaches a private note only this preset can see. A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
+          lines.push('session_read shows what one of them has been doing (detail="tools"/"all" includes tool calls, results and reasoning); session_send delivers into it; session_stop cancels its active turn; session_fork branches one into a separately managed copy; session_model reads or switches its model mid-run; session_queue shows what is still waiting in its inbox; session_describe attaches a private note only this preset can see; session_rename reads or replaces the title above (the label the sidebar shows). A subagent child cannot be driven by these tools (only its live parent session owns it); a fork can, and is fully independent.');
         }
 
         // Persist the relations this listing just observed, so they outlive the
@@ -492,14 +619,15 @@ export default {
 
     const readTool = {
       name: 'session_read',
-      description: 'Read the most recent events of one session, oldest first, newest last. detail="text" (default) returns user and assistant prose only; detail="tools" adds tool calls and their results; detail="all" also adds system/context messages, reasoning text and title changes. Reading never wakes the session, never writes to it, and works on cold persisted sessions as well as live ones.',
+      description: 'Read the most recent events of one session, oldest first, newest last. detail="text" (default) returns user and assistant prose only; detail="tools" adds tool calls and their results; detail="all" also adds system/context messages, reasoning text and title changes. Reading never wakes the session, never writes to it, and works on cold persisted sessions as well as live ones. size is YOURS to choose: maxChars caps one event (default 1200, no practical upper bound) and totalChars caps the whole response (default 12000) — raise either to read a long delivery in one call instead of getting only its first part, and the header reports which cap cut the text.',
       parameters: {
         type: 'object',
         properties: {
           sessionId: { type: 'string', description: 'Durable session id, from session_list.' },
           detail: { type: 'string', enum: ['text', 'tools', 'all'], description: '"text" (default) = prose only; "tools" = also tool calls, results and errors; "all" = also system messages, reasoning and titles.' },
           limit: { type: 'integer', description: 'How many of the newest events to return, 1-40. Defaults to 8 (with detail="tools"/"all" one tool call and its result count separately).' },
-          maxChars: { type: 'integer', description: 'Per-event character cap, 200-4000. Defaults to 1200.' },
+          maxChars: { type: 'integer', description: 'Per-event character cap, 1-500000. Defaults to 1200; raise it to read a long event without elision.' },
+          totalChars: { type: 'integer', description: 'Total character budget across the whole response, 1-5000000. Defaults to 12000, or maxChars × limit when maxChars is set explicitly. Reading stops at whichever cap is reached first.' },
         },
         required: ['sessionId'],
       },
@@ -514,7 +642,16 @@ export default {
         const withTools = detail === 'tools' || detail === 'all';
         const withAll = detail === 'all';
         const limit = clamp(asInt(input.limit, 8), 1, 40);
-        const maxChars = clamp(asInt(input.maxChars, 1200), 200, 4000);
+        const maxCharsExplicit = typeof input.maxChars === 'number' && Number.isFinite(input.maxChars);
+        // A floor of 1 instead of 200: the caller owns the size now, and 1 is a
+        // legitimate "just tell me this exists" probe.
+        const maxChars = Math.min(READ_MAX_CHARS_LIMIT, Math.max(1, asInt(input.maxChars, READ_DEFAULT_MAX_CHARS)));
+        // Widening only the per-event cap must widen the whole response with it,
+        // otherwise the old total ceiling would silently undo the raise.
+        const totalChars = Math.min(READ_TOTAL_CHARS_LIMIT, Math.max(1, asInt(input.totalChars, maxCharsExplicit ? maxChars * limit : READ_DEFAULT_TOTAL_CHARS)));
+        // Tool-call arguments used to be clipped at a fixed 400 no matter what
+        // maxChars was, which made a large maxChars useless for a long command.
+        const argCap = Math.max(400, maxChars);
 
         let inspection;
         try {
@@ -527,6 +664,11 @@ export default {
 
         const picked = [];
         let total = 0;
+        let clipped = 0;
+        let budgetStopped = false;
+        // Whether the scan stopped because it hit `limit` (false) or because it
+        // ran out of events (true) — the header reports only the latter.
+        let ended = false;
         for (let index = events.length - 1; index >= 0 && picked.length < limit; index--) {
           const event = events[index];
           if (event === null || typeof event !== 'object') continue;
@@ -548,7 +690,7 @@ export default {
             if (data !== null && typeof data === 'object' && typeof data.name === 'string') {
               const raw = typeof data.arguments === 'string' ? data.arguments : '';
               role = 'tool-call';
-              text = `${data.name}(${raw.length > 400 ? `${raw.slice(0, 400)}…` : raw})`;
+              text = `${data.name}(${raw.length > argCap ? `${raw.slice(0, argCap)}…` : raw})`;
             }
           } else if (withTools && event.type === 'tool/result') {
             const data = event.data;
@@ -576,18 +718,42 @@ export default {
           if (role === null) continue;
           const clean = text.trim();
           if (clean.length === 0) continue;
-          const clipped = clean.length > maxChars ? `${clean.slice(0, maxChars)}…` : clean;
-          total += clipped.length;
+          // Stop before spending the last slice of budget on an event that cannot
+          // fit even partially.
+          if (total + maxChars > totalChars && picked.length > 0) {
+            budgetStopped = true;
+            break;
+          }
+          const capped = clean.length > maxChars ? `${clean.slice(0, maxChars)}…` : clean;
+          total += capped.length;
+          if (clean.length > maxChars) clipped += 1;
           let time = 0;
           if (typeof event.time === 'number' && Number.isFinite(event.time)) time = event.time;
-          picked.push({ role, time, text: clipped });
-          if (total >= 12000) break;
+          picked.push({ role, time, text: capped });
+          if (total >= totalChars) {
+            budgetStopped = true;
+            break;
+          }
         }
+        ended = picked.length < limit;
         picked.reverse();
 
         const meta = inspection !== null && inspection !== undefined ? inspection.meta : undefined;
         const cwd = meta !== null && meta !== undefined && typeof meta.cwd === 'string' ? meta.cwd : '(unknown)';
-        const header = `session ${sessionId} | cwd ${cwd} | ${events.length} event(s) | detail=${detail} | showing the last ${picked.length} matching event(s)`;
+        // Say when a cap actually cut content, and which one did it — otherwise a
+        // trailing ellipsis leaves the caller guessing whether more exists.
+        let note = null;
+        if (budgetStopped) {
+          note = `stopped at the ${totalChars}-character budget (${total} of ${totalChars} returned)`;
+        } else if (clipped > 0) {
+          note = `${clipped === 1 ? '1 event' : String(clipped) + ' events'} clipped to ${maxChars} character${maxChars === 1 ? '' : 's'} each`;
+        } else if (ended) {
+          // The scan ran out of events with items still to take: a real end of list.
+          note = `reached the end of matching events (${picked.length} of limit ${limit})`;
+        }
+        const caps = `detail=${detail} | showing the last ${picked.length} matching event(s) | cap maxChars=${maxChars}, totalChars=${totalChars}`
+          + (note !== null ? ` | ${note}` : '');
+        const header = `session ${sessionId} | cwd ${cwd} | ${events.length} event(s) | ${caps}`;
         if (picked.length === 0) {
           return ok(`${header}\n\n(nothing matched — the session may be blank, or hold only events this detail level filters out)`);
         }
@@ -600,7 +766,7 @@ export default {
 
     const sendTool = {
       name: 'session_send',
-      description: "Deliver a prompt into another session and wake it. mode \"queue\" adds it to that session's pending inbox for after its current turn; mode \"steer\" delivers it at its nearest step boundary. The target is resumed if it was cold. This writes into the target session log exactly like a message its own user typed, so use it deliberately and say what you are relaying. It is also how you drive one branch of a fork without touching the other. Set callback=true to be TOLD when the target finishes that turn: the outcome (its reply, or why the turn ended badly) is delivered back into YOUR session as a queued message, and the delegation is recorded in a durable ledger you can read with session_delegations. The target needs no cooperation and no special preset for this — the watch is on your side.",
+      description: "Deliver a prompt into another session and wake it. mode \"queue\" adds it to that session's pending inbox for after its current turn; mode \"steer\" delivers it at its nearest step boundary. The target is resumed if it was cold. This writes into the target session log exactly like a message its own user typed, so use it deliberately and say what you are relaying. It is also how you drive one branch of a fork without touching the other. Set callback=true to be TOLD when the target finishes that turn: a SHORT acknowledgement (status, delegation id, whether a reply exists and its length — never the reply body) is delivered back into YOUR session as a queued message, and you then read the full delivery with session_read on the target. The delegation is also recorded in a durable ledger you can read with session_delegations. The target needs no cooperation and no special preset for this — the watch is on your side.",
       parameters: {
         type: 'object',
         properties: {
@@ -663,7 +829,7 @@ export default {
         const delegationId = nextDelegationId();
         await addDelegation({ id: delegationId, from: caller.id, to: sessionId, task: text, mode, createdAt: Date.now(), baselineSeq, status: 'pending' });
         void checkDelegations();
-        return ok(`Accepted: one ${mode} prompt delivered to ${sessionId}, with callback ${delegationId} registered. When that turn ends its outcome (the target's reply, or why it ended badly) is delivered into THIS session as a queued message — it will not interrupt a turn you are already running. session_delegations lists the ledger; session_queue marks the target too.`);
+        return ok(`Accepted: one ${mode} prompt delivered to ${sessionId}, with callback ${delegationId} registered. When that turn ends a short acknowledgement (status and reply length, not the reply itself) is delivered into THIS session as a queued message — it will not interrupt a turn you are already running — and the full delivery is read with session_read(sessionId="${sessionId}"). session_delegations lists the ledger; session_queue marks the target too.`);
       },
     };
 
@@ -748,9 +914,194 @@ export default {
       },
     };
 
+    /**
+     * Read the live inbox of one session off the control-stream baseline.
+     *
+     * The inbox lives on the live control stream: its first frame is a complete
+     * baseline carrying one queue per attached session. Read that frame, then
+     * abort the stream — subscribing must not keep anything alive.
+     *
+     * @returns `{ attached, items }` where `items` are the host queue entries
+     *   (`{ id, placement, message: { id, content }, rpcId? }`) in delivery order.
+     * @throws when the stream ends without a baseline at all.
+     */
+    const readInbox = async (controller, sessionId) => {
+      const abort = new AbortController();
+      let items = null;
+      let attached = false;
+      try {
+        for await (const frame of controller.control(abort.signal)) {
+          if (frame === null || typeof frame !== 'object' || frame.type !== 'baseline') continue;
+          const value = frame.value;
+          const queues = value !== null && value !== undefined && typeof value === 'object' ? value.queues : undefined;
+          if (queues !== null && queues !== undefined && typeof queues === 'object') {
+            attached = Object.prototype.hasOwnProperty.call(queues, sessionId);
+            items = Array.isArray(queues[sessionId]) ? queues[sessionId] : [];
+          } else {
+            items = [];
+          }
+          // Release the stream BEFORE leaving the loop: a bare `break` waits on
+          // the stream's own cancellation, and that cancellation is this signal.
+          abort.abort();
+          break;
+        }
+      } catch (error) {
+        // A throw after the baseline is the stream closing under us, not a read failure.
+        if (items === null) throw error;
+      } finally {
+        abort.abort();
+      }
+      if (items === null) throw new Error('The live control stream ended before sending a baseline.');
+      return { attached, items };
+    };
+
+    /** One pending entry's one-line preview, for management listings and dry-runs. */
+    const previewEntry = (item, maxChars) => {
+      const placement = item !== null && typeof item === 'object' && typeof item.placement === 'string' ? item.placement : 'queued';
+      const message = item !== null && typeof item === 'object' ? item.message : undefined;
+      const content = message !== null && message !== undefined && typeof message === 'object' ? message.content : undefined;
+      const text = textOf(content, false).trim().replace(/\s*\n\s*/g, ' ');
+      return { placement, text: text.length === 0 ? '(no text content)' : clip(text, maxChars) };
+    };
+
+    const queueManageTool = {
+      name: 'session_queue_manage',
+      description: "Manage the messages still waiting in another session's inbox: revoke (remove) or replace (edit) a message that has NOT been delivered yet, or clear the whole pending inbox. This is the write-side complement of the read-only session_queue. Exactly like session_send / session_stop, it may act on any live session this preset manages — never the caller itself and never a subagent-owned child. ONLY undelivered messages can be touched: once a message has been admitted into the target's current turn (or steer-injected at a step boundary) it leaves the inbox, becomes part of that session's durable history, and CANNOT be revoked or rewritten — asking for such an item returns an explicit error, never a silent success. Start with action=\"list\" to see every pending entry with its FULL stable itemId (the same id session_queue prints shortened); the id is minted when the prompt is admitted and never changes, so it is immune to concurrent delivery reshuffling. action=\"edit\" replaces the pending text in place and keeps the message's placement (queued stays queued, steering stays steering); action=\"remove\" revokes one pending item; action=\"clear\" removes every message still pending at that instant and requires confirm=true. The tool also works on a session whose turn was stopped, because session_stop keeps the pending inbox. dryRun validates and reports exactly what would change without changing anything.",
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable target session id, from session_list.' },
+          action: { type: 'string', enum: ['list', 'remove', 'edit', 'clear'], description: '"list" (default) shows pending entries with full ids; "remove" revokes one pending item by itemId; "edit" replaces one pending item\'s text, keeping its placement; "clear" removes every currently-pending item (requires confirm=true).' },
+          itemId: { type: 'string', description: 'The full id of one pending entry, from action="list". Required for remove and edit. A delivered message no longer has a pending id — it is history and cannot be changed.' },
+          text: { type: 'string', description: 'Replacement text for action="edit"; must contain non-whitespace content.' },
+          confirm: { type: 'boolean', description: 'Required true for action="clear", so an inbox is never wiped by accident.' },
+          dryRun: { type: 'boolean', description: 'Validate and report only: locate the item(s), check they are still pending, describe the exact change — and change nothing. Defaults to false.' },
+          maxChars: { type: 'integer', description: 'Per-message preview cap for list and dry-runs, 100-2000. Defaults to 400.' },
+        },
+        required: ['sessionId', 'action'],
+      },
+      output: OUTPUT,
+      async execute(args, exec) {
+        const controller = requireController();
+        if (controller === null) return fail('sessionController is unavailable in this deployment; session management is not possible here.');
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        const action = ['list', 'remove', 'edit', 'clear'].includes(input.action) ? input.action : 'list';
+        if (sessionId.length === 0) return fail('sessionId is required.');
+        if (typeof controller.control !== 'function' || typeof controller.updateQueue !== 'function') {
+          return fail('This deployment exposes no live session-control stream or queue mutation, so queued messages cannot be managed here.');
+        }
+        const dryRun = input.dryRun === true;
+        const itemId = asString(input.itemId).trim();
+        const text = asString(input.text);
+        const maxChars = clamp(asInt(input.maxChars, 400), 100, 2000);
+        const caller = callerOf(exec);
+        if (caller.id !== null && caller.id === sessionId) {
+          return fail('That is the caller itself; a session\'s own inbox is driven by its own UI, not by this coordination tool.');
+        }
+        if (action === 'edit' && text.trim().length === 0) return fail('text must contain non-whitespace content to replace a pending message.');
+        if ((action === 'remove' || action === 'edit') && itemId.length === 0) return fail(`itemId is required for action="${action}". List the queue first (action="list") to get full ids.`);
+        if (action === 'clear' && input.confirm !== true) {
+          return fail('clear requires confirm=true: it removes every message still pending in that session\'s inbox. Pass confirm=true to proceed, or dryRun=true to preview first.');
+        }
+
+        let inbox;
+        try {
+          inbox = await readInbox(controller, sessionId);
+        } catch (error) {
+          return fail(`Reading the inbox of ${sessionId} failed: ${messageOf(error)}`);
+        }
+        const { attached, items } = inbox;
+
+        const noInbox = () => `No live inbox is registered for ${sessionId}: it has no attached agent in this process (a cold session), so nothing can be pending there. Note session_stop does NOT make a session cold — it cancels the turn but keeps the inbox; only a session with no attached agent has no inbox.`;
+
+        if (action === 'list') {
+          if (items.length === 0) {
+            return ok((attached
+              ? `Session ${sessionId} has a live inbox with nothing pending.`
+              : noInbox())
+              + ' Manage pending messages with action="remove"/"edit"/"clear".');
+          }
+          const lines = [];
+          for (let index = 0; index < items.length; index++) {
+            const item = items[index];
+            const id = item !== null && typeof item === 'object' && typeof item.id === 'string' ? item.id : '';
+            const { placement, text: preview } = previewEntry(item, maxChars);
+            lines.push(`${String(index + 1)}. [${placement}] ${preview}  (id ${id.length > 0 ? id : '(none)'})`);
+          }
+          return ok(`${String(items.length)} pending message${items.length === 1 ? '' : 's'} in ${sessionId}, in delivery order (full ids — pass one to action="remove"/"edit"; a delivered message is history and no longer appears here):\n${lines.join('\n')}`);
+        }
+
+        if (!attached) return fail(noInbox());
+
+        if (action === 'remove' || action === 'edit') {
+          const entry = items.find((item) => item !== null && typeof item === 'object' && item.id === itemId);
+          const verb = action === 'remove' ? 'revoke' : 'rewrite';
+          if (dryRun) {
+            if (entry === undefined) {
+              return fail(`DRY RUN — nothing changed. No pending message ${itemId} is in ${sessionId}: it is either already delivered (admitted into that session's current turn — that is history now and cannot be undone) or the id does not exist. action="list" shows the ids still pending.`);
+            }
+            const { placement, text: preview } = previewEntry(entry, maxChars);
+            return ok(`DRY RUN — nothing changed. Would ${action === 'remove' ? 'revoke' : 'replace the text of'} pending message ${itemId} (placement ${placement}) in ${sessionId}.\nCurrent text: ${preview}${action === 'edit' ? `\nNew text:     ${clip(text, maxChars)}` : ''}`);
+          }
+          try {
+            await controller.updateQueue({
+              sessionId,
+              itemId,
+              action: action === 'remove' ? { kind: 'remove' } : { kind: 'edit', content: [{ type: 'text', text }] },
+            });
+          } catch (error) {
+            const code = codeOf(error);
+            if (code === 'session/queue-item-not-found') {
+              return fail(`Could not ${verb} ${itemId} in ${sessionId}: it is no longer pending — it was already delivered (admitted into that session's current turn), and delivered messages are that session's history, which cannot be changed. Use action="list" to see what is still pending.`);
+            }
+            if (code === 'session/agent-busy') {
+              return fail(`Could not ${verb} ${itemId} in ${sessionId}: the target is owned by subagent routing (a subagent child); only its live parent session can manage its queue.`);
+            }
+            if (code === 'session/attachment-invalid' || code === 'gateway/bad-request') {
+              return fail(`Edit of ${itemId} in ${sessionId} rejected: ${messageOf(error)}`);
+            }
+            return fail(`Queue mutation of ${itemId} in ${sessionId} failed: ${messageOf(error)}`);
+          }
+          return ok(action === 'remove'
+            ? `Revoked pending message ${itemId} from ${sessionId}; it will never be delivered. (Already-delivered messages are history and are untouched.)`
+            : `Replaced the pending text of ${itemId} in ${sessionId}; it keeps its placement and will be delivered with the new text.`
+            + (action === 'edit' ? `\nNew text: ${text}` : ''));
+        }
+
+        // clear
+        if (items.length === 0) {
+          return ok(`Nothing pending in ${sessionId} — the inbox is already empty.`);
+        }
+        if (dryRun) {
+          const clearLines = items.map((item) => {
+            const id = item !== null && typeof item === 'object' && typeof item.id === 'string' ? item.id : '(none)';
+            const { placement, text: preview } = previewEntry(item, maxChars);
+            return `- [${placement}] ${preview}  (id ${id})`;
+          });
+          return ok(`DRY RUN — nothing changed. clear would remove ${String(items.length)} pending message(s) from ${sessionId}:\n${clearLines.join('\n')}`);
+        }
+        const removed = [];
+        const failures = [];
+        for (const item of items) {
+          const id = item !== null && typeof item === 'object' && typeof item.id === 'string' ? item.id : '';
+          if (id.length === 0) continue;
+          try {
+            await controller.updateQueue({ sessionId, itemId: id, action: { kind: 'remove' } });
+            removed.push(id);
+          } catch (error) {
+            if (codeOf(error) === 'session/queue-item-not-found') failures.push(`${id} (was already delivered between list and clear — left as history, cannot be revoked)`);
+            else failures.push(`${id} (${messageOf(error)})`);
+          }
+        }
+        return ok(`Cleared ${String(removed.length)}/${String(items.length)} pending message(s) from ${sessionId}.\n${failures.length === 0 ? '' : `Not removed:\n${failures.join('\n')}`}`
+          + ' Already-delivered messages are that session\'s history and are never touched.');
+      },
+    };
+
     const delegationsTool = {
       name: 'session_delegations',
-      description: 'Read the delegation ledger: one row per session_send you made with callback=true, with its target, the task excerpt, and its state. pending = the target has not finished that turn yet; done = it finished and here is the reply it produced; failed = that turn ended aborted, blocked or errored; unknown = nothing confirmed it (for example a watcher timed out). Reading also performs a check pass, so a finished delegation appears here even if the automatic callback notice never reached you. The ledger is durable: it survives restarts, and a delegation still pending from before a restart keeps being watched.',
+      description: 'Read the delegation ledger: one row per session_send you made with callback=true, with its target, the task excerpt, and its state. pending = the target has not finished that turn yet; done = it finished and here is an excerpt of the reply it produced (the callback notice itself is only a short acknowledgement — read the full delivery with session_read on the target); failed = that turn ended aborted, blocked or errored; unknown = nothing confirmed it (for example a watcher timed out). A row that asked its delegator a question shows the question and your answer as `asked:` lines; unlike the `note:` line, those survive the task settling. Reading also performs a check pass, so a finished delegation appears here even if the automatic callback notice never reached you. The ledger is durable: it survives restarts, and a delegation still pending from before a restart keeps being watched.',
       parameters: {
         type: 'object',
         properties: {
@@ -793,8 +1144,18 @@ export default {
         const lines = [`${String(rows.length)} delegation(s), newest first · ${String(pendingAll)} pending in total:`];
         for (const row of rows) {
           const age = row.createdAt > 0 ? `, ${String(Math.max(0, Math.round((Date.now() - row.createdAt) / 1000)))}s ago` : '';
-          lines.push(`- ${row.id} · to ${row.to} · ${row.status} (${row.mode}${age}) · task: ${row.task.length > 0 ? row.task : '(no text)'}`);
+          // `notified` is the durable "its callback notice was delivered" marker.
+          // A settled row still showing `not notified` is one the watcher will
+          // announce exactly once, which is what makes a missing callback
+          // diagnosable without guessing.
+          const notice = row.status === 'pending' ? '' : (row.notifiedAt > 0 ? ' · notified' : ' · not notified');
+          lines.push(`- ${row.id} · to ${row.to} · ${row.status} (${row.mode}${age}${notice}) · task: ${row.task.length > 0 ? row.task : '(no text)'}`);
           if (row.reply.length > 0) lines.push(`    reply: ${clip(row.reply, 400)}`);
+          // `askLog` is the durable ask record. `note` is overwritten when the
+          // task settles, so anything written there would vanish; this field is
+          // the only one that survives into history, and it is what makes a
+          // question that was forwarded to you — and your answer to it — auditable.
+          if (row.askLog.length > 0) for (const entry of row.askLog.split('\n')) lines.push(`    asked: ${entry}`);
           if (row.note.length > 0) lines.push(`    note: ${row.note}`);
         }
         lines.push('pending rows settle automatically once their target ends that turn; dismiss a row you are done with.');
@@ -1057,6 +1418,77 @@ export default {
       },
     };
 
+    const renameTool = {
+      name: 'session_rename',
+      description: "Read or set the TITLE of another session — the short label the GUI sidebar, session_list and every other agent see. Omit `title` to read the current one; pass `title` to set it. The title is stored in the session's own durable log as a `session/title` event, so it is visible everywhere, unlike session_describe's private note; the note and the title are independent. Setting a title PINS it: in-flight automatic title generation is superseded and later user messages schedule none, so the label you set stays yours. The host normalizes what you pass (control characters and ANSI escapes are stripped, runs of whitespace collapse to one space) and truncates it to its own byte budget, so the accepted title can be shorter than what you sent — the reply reports the title as ACCEPTED, which is the one now in effect. An empty or all-invisible title is refused: pass real text, and use session_describe with an empty string to clear the private note instead (a session's title can never be unset, only replaced). The target is resumed if it was cold.",
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable target session id, from session_list.' },
+          title: { type: 'string', description: 'New title. Omit the field entirely to read the current title instead of setting one. Must contain visible characters after the host normalizes it; one line, and keep it short — the host truncates it to a byte budget and reports what it accepted.' },
+        },
+        required: ['sessionId'],
+      },
+      output: OUTPUT,
+      async execute(args) {
+        const controller = requireController();
+        if (controller === null) return fail('sessionController is unavailable in this deployment; session management is not possible here.');
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        if (sessionId.length === 0) return fail('sessionId is required.');
+
+        // Read mode: omit `title` entirely. An empty string is a WRITE of an empty
+        // title, which no session may hold, so the two must not be confused.
+        if (typeof input.title !== 'string') {
+          const current = await titleOf(controller, sessionId);
+          if (current === null) {
+            return ok(`Session ${sessionId} has no durable title yet (the host derives a display label from its directory instead). Pass a title to set one.`);
+          }
+          return ok(`session ${sessionId} title: ${current}\nThis is the title the GUI sidebar and session_list show for it. Pass title=... to replace it, or session_describe for a private note only this preset can see.`);
+        }
+
+        const requested = visibleTitleOf(input.title);
+        if (requested.length === 0) {
+          return fail('That title normalizes to nothing visible (it is only whitespace, control characters or invisible marks). A session title must carry visible characters and can never be unset — pass real text to set one, or omit `title` to read the current one.');
+        }
+
+        let accepted;
+        try {
+          accepted = await controller.rename({ sessionId, title: input.title });
+        } catch (error) {
+          const code = codeOf(error);
+          let hint = '';
+          if (code === 'session/title-invalid') hint = ' The host normalized that text to nothing visible; a session title must carry visible characters.';
+          else if (code === 'session/not-found') hint = ' No persisted session has that id.';
+          else if (code === 'session/agent-busy') hint = ' The target is owned by subagent routing (a subagent child); only its live parent session can rename it.';
+          else if (code === 'gateway/internal' && messageOf(error).includes('session-title')) hint = ' This deployment mounts no session-title service, so no session can be renamed here.';
+          return fail(`Renaming ${sessionId} failed: ${messageOf(error)}${hint}`);
+        }
+
+        // The host's answer, not our echo of the input: it normalized and
+        // truncated the text, and only what it accepted is now in effect.
+        const title = accepted !== null && accepted !== undefined && typeof accepted.title === 'string' && accepted.title.length > 0
+          ? accepted.title
+          : requested;
+        const seq = accepted !== null && accepted !== undefined && typeof accepted.seq === 'number' && Number.isFinite(accepted.seq) ? accepted.seq : null;
+        // Keep the durable record in step with what the log now says, so a
+        // listing that runs before this session is observed again still reports
+        // the new title. `setTitle` touches only that one field — `observe`
+        // would also blank this session's lineage, which for a fork child would
+        // silently reclassify it as top-level.
+        try {
+          await setTitle(sessionId, title);
+        } catch (error) {
+          // Bookkeeping is best-effort: the rename itself already landed.
+        }
+        return ok(
+          `Renamed ${sessionId} to: ${title}${seq === null ? '' : ` (durable session/title event at seq ${String(seq)})`}. `
+          + 'This title is now pinned: automatic title generation will not overwrite it, and later messages will not schedule one. '
+          + 'It is visible in the GUI sidebar and to every other session — the private, only-this-preset note stays separate (session_describe).',
+        );
+      },
+    };
+
     const describeTool = {
       name: 'session_describe',
       description: "Attach, change, or read a private note for one session — one short line saying what that session is FOR, or what you are waiting on from it. The note is NOT the session title: this preset stores it in its own file and never appends it to any session log, so the session list, the sidebar, the trajectory view and every other agent never see it. It is shown by this preset's session_list. Omit `description` to read the current note; pass an empty string to clear it.",
@@ -1103,6 +1535,56 @@ export default {
             : `Note for ${sessionId} set to: ${stored}${unknown} (persisted in ${statePath()})`);
         } catch (error) {
           return fail(`Writing the note failed: ${messageOf(error)}`);
+        }
+      },
+    };
+
+    const archiveTool = {
+      name: 'session_archive',
+      description: "Archive or unarchive one session through the running workspace registry: archive hides the session from every GUI workspace sidebar while keeping its log, records and position intact (nothing is deleted; unarchive restores it). This is the same registry path the sidebar's own Archive action uses, so it applies immediately and durably in the running process — no restart — and archive also clears that session's pin in the same write. Archive of an already-archived session is a no-op. Without stopActivity an archive is refused while the session has running work (a turn, subagent, job or reminder); pass stopActivity to let the registry stop that work and archive anyway. The target must be known to persistence or be live. Do not archive this conversation's own session id from inside it: with stopActivity that would end the current turn.",
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Durable target session id, from session_list.' },
+          action: { type: 'string', enum: ['archive', 'unarchive'], description: 'archive hides the session from the workspace sidebar (default); unarchive shows it again, at its recorded position.' },
+          stopActivity: { type: 'boolean', description: 'Only for action=archive: allow archiving a session with running work by stopping that work first (turn, subagent, job, reminder). Default false — a session with running activity is refused.' },
+        },
+        required: ['sessionId'],
+      },
+      output: OUTPUT,
+      async execute(args, exec) {
+        const workspaces = requireWorkspaces();
+        if (workspaces === null) return fail('workspaceRegistry is unavailable in this deployment; archival is not possible here.');
+        const input = args !== null && typeof args === 'object' ? args : {};
+        const sessionId = asString(input.sessionId).trim();
+        if (sessionId.length === 0) return fail('sessionId is required.');
+        const action = asString(input.action).trim() === 'unarchive' ? 'unarchive' : 'archive';
+        const stopActivity = input.stopActivity === true;
+        const caller = callerOf(exec);
+        if (action === 'archive' && caller.id !== null && caller.id === sessionId) {
+          return fail('That is the caller itself; archiving your own session from inside it would end this conversation. Have a sibling coordinator session or the workspace UI archive it instead.');
+        }
+        try {
+          if (action === 'archive') {
+            await workspaces.archiveSession(sessionId, { stopActivity });
+            const note = stopActivity ? ' Its running work was stopped so the archive could go through.' : '';
+            return ok(`Archived ${sessionId}: it is hidden from the workspace sidebar; its log, records and position are kept.${note} Restore it with session_archive action=unarchive.`);
+          }
+          await workspaces.unarchiveSession(sessionId);
+          return ok(`Unarchived ${sessionId}: it shows in the workspace sidebar again, at its recorded position.`);
+        } catch (error) {
+          const name = error !== null && typeof error === 'object' ? error.name : undefined;
+          const message = messageOf(error);
+          if (action === 'archive' && name === 'WorkspaceActiveSessionError') {
+            return fail(`Archiving ${sessionId} was refused: the session has running activity and stopActivity was not set. Pass stopActivity to stop that work and archive anyway (${message}).`);
+          }
+          if (name === 'WorkspaceUnknownSessionError') {
+            return fail(`Archiving ${sessionId} failed: no live or persisted session has that id (${message}).`);
+          }
+          if (action === 'unarchive') {
+            return fail(`Unarchiving ${sessionId} failed: ${message}`);
+          }
+          return fail(`Archiving ${sessionId} failed: ${message}`);
         }
       },
     };
@@ -1246,11 +1728,14 @@ export default {
     ctx.tools.register(readTool);
     ctx.tools.register(sendTool);
     ctx.tools.register(queueTool);
+    ctx.tools.register(queueManageTool);
     ctx.tools.register(delegationsTool);
     ctx.tools.register(stopTool);
     ctx.tools.register(compactTool);
     ctx.tools.register(forkTool);
     ctx.tools.register(createTool);
+    ctx.tools.register(renameTool);
     ctx.tools.register(describeTool);
+    ctx.tools.register(archiveTool);
   },
 };

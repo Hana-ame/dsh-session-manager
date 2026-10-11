@@ -97,7 +97,23 @@ const controller = {  list: async () => ({ items: [
       error.code = 'gateway/internal'
       throw error
     }
-    return { title: request.title, seq: 99 }
+    // The REAL host normalizes and truncates before accepting (`dsh-session-title`
+    // `normalizeSessionTitle`), so the returned title is NOT the string that was
+    // sent. Mirror that here: an echo-back fake would let a tool that reports its
+    // own input instead of the host's answer pass every test.
+    const normalized = request.title
+      .replace(/[\u001B\u009B][0-?]*[ -/]*[@-~]/gu, '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu, '')
+      .replace(/\s+/gu, ' ')
+      .trim()
+      .slice(0, 24)
+      .trimEnd()
+    if (normalized.length === 0) {
+      const error = new Error('session title must contain visible characters')
+      error.code = 'session/title-invalid'
+      throw error
+    }
+    return { title: normalized, seq: 99 }
   },
   modelCatalog: async () => ({
     default: { provider: 'p1', model: 'm1' },
@@ -132,9 +148,27 @@ const agents = { get: (id) => (id === 'session-cold' ? undefined : { id }) }
 /**
  * The durable workspace registry. `/tmp/repo` is a registered workspace root, so
  * a session created there is ATTACHED (workspaceId form); any other directory is
- * not, and keeps its exact cwd.
+ * not, and keeps its exact cwd. It also carries the archive registry the
+ * sidebar's own Archive action writes, which `session_archive` drives.
  */
-const workspaces = { resolveByPath: async (path) => (path === '/tmp/repo' ? { id: 'ws-1', path: '/tmp/repo' } : undefined) }
+const workspaces = {
+  resolveByPath: async (path) => (path === '/tmp/repo' ? { id: 'ws-1', path: '/tmp/repo' } : undefined),
+  archiveSession: async (sessionId, options) => {
+    calls.push(['archiveSession', sessionId, String(options.stopActivity)])
+    const active = sessionId === 'session-running'
+    if (active && options.stopActivity !== true) {
+      const error = new Error('the session has active activity')
+      error.name = 'WorkspaceActiveSessionError'
+      throw error
+    }
+    if (sessionId === 'session-ghost') {
+      const error = new Error('unknown session')
+      error.name = 'WorkspaceUnknownSessionError'
+      throw error
+    }
+  },
+  unarchiveSession: async (sessionId) => { calls.push(['unarchiveSession', sessionId]) },
+}
 
 /** The timer service, captured so the test decides when the watcher runs. */
 const timer = { interval: (callback) => { ticks.push(callback); return () => {} } }
@@ -154,8 +188,8 @@ const check = (label, condition, detail) => {
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
 
-check('twelve tools registered', same(Object.keys(captured).sort(), [
-  'session_compact', 'session_create', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_read', 'session_send', 'session_stop',
+check('fifteen tools registered', same(Object.keys(captured).sort(), [
+  'session_archive', 'session_compact', 'session_create', 'session_delegations', 'session_describe', 'session_fork', 'session_list', 'session_model', 'session_models', 'session_queue', 'session_queue_manage', 'session_read', 'session_rename', 'session_send', 'session_stop',
 ]), Object.keys(captured).join(','))
 
 // Every tool here registers through the RAW `ctx.tools.register()` path rather
@@ -260,6 +294,50 @@ check('all detail has system, reasoning and title',
   all.text.includes('injected context') && all.text.includes('secret thoughts') && all.text.includes('My title'), all.text)
 check('oldest first ordering kept', all.text.indexOf('hello there') < all.text.indexOf('My title'), all.text)
 
+// session_read size is the caller's to choose: maxChars is the per-event cap and
+// totalChars is the whole-response budget. Neither is fixed any more, but an
+// unqualified call still costs exactly what it used to (1200 per event, 12000 total).
+{
+  const BODY = 'A'.repeat(9000) + 'END-OF-BODY'
+  const ARGS = JSON.stringify({ command: 'printf "%s" ' + '"'.repeat(9000) })
+  logs['session-long'] = [
+    { type: 'user/message', seq: 1, time: 11000, data: { id: 'lm1', role: 'user', content: [{ type: 'text', text: BODY }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 2, time: 12000, data: { turn: 1, step: 1, message: { id: 'lm2', role: 'assistant', content: [{ type: 'text', text: 'short answer' }], source: { kind: 'model', provider: 'p', model: 'm' } } } },
+    { type: 'tool/call', seq: 3, time: 13000, data: { turn: 1, step: 1, callId: 'lc1', name: 'bash', arguments: ARGS } },
+  ]
+  const defaultRead = await captured.session_read.execute({ sessionId: 'session-long', detail: 'tools' })
+  check('read default still clips one long event at 1200',
+    /cap maxChars=1200, totalChars=12000/.test(defaultRead.text)
+      && /clipped to 1200 characters each/.test(defaultRead.text)
+      && !defaultRead.text.includes('END-OF-BODY'), defaultRead.text.slice(0, 300))
+  const wideRead = await captured.session_read.execute({ sessionId: 'session-long', detail: 'tools', maxChars: 20000 })
+  check('read honours a raised maxChars without eliding a long event',
+    wideRead.text.includes(BODY) && /cap maxChars=20000, totalChars=160000/.test(wideRead.text)
+      && !wideRead.text.includes('clipped'), wideRead.text.slice(0, 300))
+  const tightRead = await captured.session_read.execute({ sessionId: 'session-long', detail: 'tools', maxChars: 2000, totalChars: 1500 })
+  check('read stops at the totalChars budget and says so',
+    /totalChars=1500/.test(tightRead.text)
+      && /stopped at the 1500-character budget \(2001 of 1500 returned\)/.test(tightRead.text)
+      && !tightRead.text.includes('END-OF-BODY'), tightRead.text.slice(0, 300))
+  check('read reports the cap that cut the text, not a bare ellipsis',
+    /stopped at the 1500-character budget/.test(tightRead.text)
+      && !/clipped to/.test(tightRead.text) && !/reached the end/.test(tightRead.text), tightRead.text.split('\n')[0])
+  check('read widens the tool-call argument cap with maxChars',
+    wideRead.text.includes(ARGS) && !defaultRead.text.includes(ARGS), defaultRead.text.slice(0, 300))
+  const floorRead = await captured.session_read.execute({ sessionId: 'session-long', maxChars: 1 })
+  check('read floors maxChars at 1 and accepts it',
+    /cap maxChars=1, totalChars=8/.test(floorRead.text)
+      && /clipped to 1 character each/.test(floorRead.text), floorRead.text.slice(0, 300))
+  const hugeMaxChars = await captured.session_read.execute({ sessionId: 'session-long', maxChars: 10 ** 12 })
+  check('read clamps an absurd maxChars to the 500000 ceiling',
+    /cap maxChars=500000/.test(hugeMaxChars.text) && hugeMaxChars.text.includes('END-OF-BODY'),
+    hugeMaxChars.text.slice(0, 300))
+  const hugeTotalChars = await captured.session_read.execute({ sessionId: 'session-long', totalChars: 10 ** 12 })
+  check('read clamps an absurd totalChars to the 5000000 ceiling',
+    /totalChars=5000000/.test(hugeTotalChars.text), hugeTotalChars.text.split('\n')[0])
+
+}
+
 // send / stop / fork
 check('send ok', (await captured.session_send.execute({ sessionId: 'session-b', text: 'status?', mode: 'steer' }, callerExec)).ok === true
   && calls.some((c) => c[0] === 'prompt' && c[2] === 'steer' && c[3] === 'status?'))
@@ -271,6 +349,44 @@ check('fork returns child', (await captured.session_fork.execute({ sessionId: 's
 check('fork auto-titles "<title> · fork"', calls.some((c) => c[0] === 'rename' && c[1] === 'session-forked' && c[2] === 'Alpha · fork'))
 await captured.session_fork.execute({ sessionId: 'session-a', atSeq: 42, title: 'branch B' }, callerExec)
 check('fork passes atSeq and title', calls.some((c) => c[0] === 'fork' && c[2] === '42') && calls.some((c) => c[1] === 'session-forked' && c[2] === 'branch B'))
+
+// session_rename: read and set the title the whole GUI sees
+const renamesBefore = calls.filter((c) => c[0] === 'rename').length
+const readTitle = await captured.session_rename.execute({ sessionId: 'session-a' }, callerExec)
+check('rename read returns the projected title', readTitle.ok === true && readTitle.text.includes('title: Alpha'), readTitle.text)
+check('rename read writes nothing', calls.filter((c) => c[0] === 'rename').length === renamesBefore)
+check('rename read explains an untitled session',
+  (await captured.session_rename.execute({ sessionId: 'session-c' }, callerExec)).text.includes('no durable title'))
+const renamed = await captured.session_rename.execute({ sessionId: 'session-a', title: '  parser   rewrite  ' }, callerExec)
+check('rename passes the RAW title to the host, not a pre-trimmed copy',
+  calls.some((c) => c[0] === 'rename' && c[1] === 'session-a' && c[2] === '  parser   rewrite  '),
+  JSON.stringify(calls.filter((c) => c[0] === 'rename').slice(-1)))
+check('rename reports the ACCEPTED title and the pinning side effect',
+  renamed.ok === true && renamed.text.includes('Renamed session-a to: parser rewrite') && renamed.text.includes('pinned'), renamed.text)
+// The host is the authority on what it accepted: it normalizes and truncates, so
+// the report must echo ITS answer rather than the string that was sent.
+const truncated = await captured.session_rename.execute({ sessionId: 'session-a', title: 'a title far longer than the host accepts' }, callerExec)
+check('rename reports what the host accepted, not what was sent',
+  truncated.text.includes('to: a title far longer th') && !truncated.text.includes('host accepts'), truncated.text)
+check('rename records the accepted title in the durable store',
+  (await persisted()).byId['session-a'].title === 'a title far longer than',
+  JSON.stringify((await persisted()).byId['session-a']))
+check('rename leaves the session lineage alone',
+  (await persisted()).byId['session-a'].parentId === null && (await persisted()).byId['session-a'].kind === 'top-level',
+  JSON.stringify((await persisted()).byId['session-a']))
+check('an all-invisible title is refused before it reaches the host',
+  (await captured.session_rename.execute({ sessionId: 'session-a', title: '‎  ' }, callerExec)).ok === false)
+check('an ANSI-only title is refused before it reaches the host',
+  (await captured.session_rename.execute({ sessionId: 'session-a', title: '[31m[0m' }, callerExec)).ok === false)
+check('an empty title is refused as an un-settable title, not silently ignored',
+  (await captured.session_rename.execute({ sessionId: 'session-a', title: '' }, callerExec)).ok === false)
+check('only the three settable renames reached the host',
+  calls.filter((c) => c[0] === 'rename').length === 4,
+  JSON.stringify(calls.filter((c) => c[0] === 'rename')))
+const hostRejected = await captured.session_rename.execute({ sessionId: 'session-a', title: 'boom' }, callerExec)
+check('a host refusal is surfaced with its code explained',
+  hostRejected.ok === false && hostRejected.text.includes('Renaming session-a failed'), hostRejected.text)
+check('rename requires a sessionId', (await captured.session_rename.execute({}, callerExec)).ok === false)
 
 // session_queue
 const mutationsBefore = calls.filter((c) => c[0] === 'prompt' || c[0] === 'cancel').length
@@ -339,7 +455,7 @@ const settledRows = await ledger()
 check('the delegation settles done with the reply it produced',
   settledRows[0].status === 'done' && settledRows[0].reply === 'parser work is done; two files changed', JSON.stringify(settledRows[0]))
 check('the outcome is delivered into the delegator session as a queued message',
-  calls.some((c) => c[0] === 'prompt' && c[1] === 'me' && c[2] === 'queue' && c[3].includes('[委托回调]') && c[3].includes('parser work is done')),
+  calls.some((c) => c[0] === 'prompt' && c[1] === 'me' && c[2] === 'queue' && c[3].includes('[callback]') && c[3].includes('session_read') && !c[3].includes('parser work is done')),
   JSON.stringify(calls.filter((c) => c[0] === 'prompt' && c[1] === 'me').map((c) => c[3])))
 const mePrompts = () => calls.filter((c) => c[0] === 'prompt' && c[1] === 'me').length
 const deliveredOnce = mePrompts()
@@ -407,6 +523,27 @@ const afterCreate = JSON.parse(await readFile(statePath, 'utf8'))
 check('the created session is recorded in the durable ledger',
   afterCreate.byId['session-new-1'] !== undefined && afterCreate.byId['session-new-1'].kind === 'top-level' && afterCreate.byId['session-new-1'].cwd === '/tmp/repo',
   JSON.stringify(afterCreate.byId['session-new-1']))
+
+// session_archive: the same registry write the sidebar's Archive action makes
+const archived = await captured.session_archive.execute({ sessionId: 'session-b' }, callerExec)
+check('archive hides a session and keeps its records', archived.ok === true
+  && archived.text.includes('Archived session-b') && archived.text.includes('log, records and position are kept'), archived.text)
+check('archive goes through the workspace registry with stopActivity off',
+  calls.some((row) => row[0] === 'archiveSession' && row[1] === 'session-b' && row[2] === 'false'),
+  JSON.stringify(calls.filter((row) => row[0] === 'archiveSession')))
+check('archive reports when it had to stop running work',
+  (await captured.session_archive.execute({ sessionId: 'session-running', stopActivity: true }, callerExec)).text.includes('running work was stopped'))
+const refused = await captured.session_archive.execute({ sessionId: 'session-running' }, callerExec)
+check('an active session is refused without stopActivity, and says how to proceed',
+  refused.ok === false && refused.text.includes('stopActivity'), refused.text)
+check('unarchive restores it at its recorded position',
+  (await captured.session_archive.execute({ sessionId: 'session-b', action: 'unarchive' }, callerExec)).text.includes('Unarchived session-b')
+  && calls.some((row) => row[0] === 'unarchiveSession' && row[1] === 'session-b'))
+check('an unknown session is reported as such',
+  (await captured.session_archive.execute({ sessionId: 'session-ghost' }, callerExec)).ok === false)
+check('archiving the caller itself is refused',
+  (await captured.session_archive.execute({ sessionId: 'me' }, callerExec)).ok === false)
+check('archive requires a sessionId', (await captured.session_archive.execute({}, callerExec)).ok === false)
 
 const failures = results.filter((row) => row[0] === 'FAIL')
 for (const [status, label, detail] of results) console.log(`${status}  ${label}${detail}`)

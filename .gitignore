@@ -1,0 +1,23 @@
+node_modules/
+dist/
+*.log
+*.tgz
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Hand edits are backed up next to the real file. Backups are not source of
+# truth and must never be loaded, so they stay out of the tree.
+*.prompt-backup
+*.bak
+~
+
+# `bundle/` is the migrated preset bundle, but its cordis.patch.yml must name
+# the package modules with absolute file:// URLs: `name` is a literal and
+# `!!js` expressions only evaluate inside `config`. The URLs therefore embed
+# this machine's $DSH_HOME (/home/lumin/...), so the file is unusable and
+# non-portable for anyone else. Regenerate it on the target machine against
+# its own install path instead of copying this directory.
+bundle/

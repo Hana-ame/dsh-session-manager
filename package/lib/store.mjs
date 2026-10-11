@@ -27,7 +27,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /** Current on-disk format. */
-export const STATE_VERSION = 3
+export const STATE_VERSION = 5
 /** Cap on a describe note, in characters. */
 export const NOTE_MAX_CHARS = 200
 /** Cap on a persisted title, in characters. */
@@ -36,8 +36,22 @@ export const TITLE_MAX_CHARS = 120
 export const DELEGATION_TASK_CHARS = 200
 /** Cap on the reply one delegation keeps. */
 export const DELEGATION_REPLY_CHARS = 1200
+/**
+ * Cap on one delegation's ask log. Settling a delegation rewrites `note` with the
+ * turn outcome, so a question handed to the delegator cannot live there and still
+ * be readable afterwards; this field is what records the hand-off and the
+ * delegator's decision, and nothing that settles a row ever touches it.
+ */
+export const DELEGATION_ASK_LOG_CHARS = 800
 /** How many delegations the ledger retains (newest first). */
 export const DELEGATION_KEEP = 200
+/**
+ * How many delivery attempts one callback notice may make before the store
+ * stops offering it. A notice whose delivery keeps throwing (the delegator
+ * session was deleted, say) must not be retried forever; the failure reason
+ * stays in the row's note either way.
+ */
+export const DELEGATION_NOTICE_MAX_ATTEMPTS = 5
 /** Every state a delegation record can be in. */
 export const DELEGATION_STATUSES = ['pending', 'done', 'failed', 'unknown']
 /** Path cap, generous enough for any real working directory. */
@@ -112,8 +126,11 @@ export const blankDelegation = () => ({
   createdAt: 0,
   baselineSeq: 0,
   settledAt: 0,
+  notifiedAt: 0,
+  noticeAttempts: 0,
   reply: '',
   note: '',
+  askLog: '',
 })
 
 /** Normalize one on-disk delegation; a record without an id or endpoints is dropped. */
@@ -132,8 +149,11 @@ const normalizeDelegation = (value) => {
     createdAt: asTime(value.createdAt),
     baselineSeq: typeof value.baselineSeq === 'number' && Number.isFinite(value.baselineSeq) && value.baselineSeq > 0 ? Math.floor(value.baselineSeq) : 0,
     settledAt: asTime(value.settledAt),
+    notifiedAt: asTime(value.notifiedAt),
+    noticeAttempts: typeof value.noticeAttempts === 'number' && Number.isFinite(value.noticeAttempts) && value.noticeAttempts > 0 ? Math.floor(value.noticeAttempts) : 0,
     reply: typeof value.reply === 'string' ? clip(value.reply, DELEGATION_REPLY_CHARS) : '',
     note: typeof value.note === 'string' ? clip(value.note, 400) : '',
+    askLog: typeof value.askLog === 'string' ? clip(value.askLog, DELEGATION_ASK_LOG_CHARS) : '',
   }
 }
 
@@ -153,9 +173,20 @@ const parseState = (raw) => {
     if (record !== null) state.byId[id] = record
   }
   const delegations = Array.isArray(parsed.delegations) ? parsed.delegations : []
+  // A row written before `notifiedAt` existed carries no delivery marker, and
+  // the pre-4 code announced every settled row (repeatedly, which is the bug),
+  // so a settled legacy row was delivered unless its note records a failed
+  // attempt. Back-filling `notifiedAt` for those keeps the upgrade from firing
+  // one final catch-up round over the whole history, while leaving a genuinely
+  // undelivered row for the recovery pass to retry once.
+  const legacyRows = !(typeof parsed.version === 'number' && parsed.version >= STATE_VERSION)
   for (const value of delegations) {
     const delegation = normalizeDelegation(value)
-    if (delegation !== null) state.delegations.push(delegation)
+    if (delegation === null) continue
+    if (legacyRows && delegation.status !== 'pending' && delegation.notifiedAt === 0 && !delegation.note.includes('回调未投递')) {
+      delegation.notifiedAt = delegation.settledAt > 0 ? delegation.settledAt : Date.now()
+    }
+    state.delegations.push(delegation)
   }
   return state
 }
@@ -191,14 +222,46 @@ const seedFromLegacy = async () => {
   return state
 }
 
-let cache = null
-let stamp = null
-let queue = Promise.resolve()
+// ── one writer per state file, per PROCESS (not per module instance) ─────────
+//
+// The cache and the write queue are keyed on the resolved state path in a
+// process-global registry rather than on module-local bindings, and for the same
+// reason `readState`/`flush` are stat-validated: this package's plugin file can
+// be evaluated more than once in one process (a re-imported row, a second
+// embedded runtime, a copied install). Module-local state would then give each
+// instance its own cache and its own serialization queue, so two instances could
+// both read a delegation as `pending`, both settle it and both enqueue a
+// callback notice — the duplicate-delivery failure this file's delegation
+// comment describes. Sharing the slot makes the "claim" in `settleDelegation`
+// atomic across every instance in the process, which is what the caller relies
+// on to notify exactly once.
+const REGISTRY = Symbol.for('@local/dsh-session-manager.store.v2')
+
+/** The process-global store registry, created on first use. */
+const registry = () => {
+  const holder = globalThis
+  const existing = holder[REGISTRY]
+  if (existing !== undefined && existing !== null && typeof existing === 'object' && existing.files instanceof Map && existing.noticeInFlight instanceof Set) return existing
+  const created = { files: new Map(), noticeInFlight: new Set() }
+  holder[REGISTRY] = created
+  return created
+}
+
+/** The shared `{ cache, stamp, queue, serial }` slot for one state path. */
+const slotFor = (path) => {
+  const files = registry().files
+  let slot = files.get(path)
+  if (slot === undefined) {
+    slot = { cache: null, stamp: null, queue: Promise.resolve(), serial: 0 }
+    files.set(path, slot)
+  }
+  return slot
+}
 
 /** Identity of the file on disk, or null when it does not exist yet. */
-const fileStamp = async () => {
+const fileStamp = async (path) => {
   try {
-    const info = await stat(statePath())
+    const info = await stat(path)
     return `${String(info.mtimeMs)}:${String(info.size)}`
   } catch {
     return null
@@ -210,42 +273,52 @@ const fileStamp = async () => {
  * cache. Callers get the live object; treat it as read-only.
  */
 export const readState = async () => {
-  const current = await fileStamp()
-  if (cache !== null && current === stamp) return cache
+  const path = statePath()
+  const slot = slotFor(path)
+  const current = await fileStamp(path)
+  if (slot.cache !== null && current === slot.stamp) return slot.cache
   let raw = null
   try {
-    raw = await readFile(statePath(), 'utf8')
+    raw = await readFile(path, 'utf8')
   } catch {
     raw = null
   }
-  cache = raw === null ? await seedFromLegacy() : parseState(raw)
-  stamp = current
-  return cache
+  slot.cache = raw === null ? await seedFromLegacy() : parseState(raw)
+  slot.stamp = current
+  return slot.cache
 }
 
 /** Write the whole state atomically and install it as the cache. */
 const flush = async (state) => {
+  const path = statePath()
+  const slot = slotFor(path)
   await mkdir(stateDir(), { recursive: true })
-  const target = statePath()
-  const temp = `${target}.${String(process.pid)}.tmp`
+  // The temp name is unique per write, not just per process: two module
+  // instances in one process share `process.pid`, and a name derived from it
+  // alone lets one instance rename away a temp file the other is still writing.
+  slot.serial += 1
+  const temp = `${path}.${String(process.pid)}.${String(slot.serial)}.tmp`
   await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
-  await rename(temp, target)
-  cache = state
-  stamp = await fileStamp()
-  return cache
+  await rename(temp, path)
+  slot.cache = state
+  slot.stamp = await fileStamp(path)
+  return slot.cache
 }
 
 /**
- * Serialize every write behind one queue. A change function returning null means
- * "nothing changed", which skips the file write entirely.
+ * Serialize every write behind one queue — the PROCESS-wide queue for this state
+ * path, so two module instances cannot interleave a read-modify-write. A change
+ * function returning null means "nothing changed", which skips the file write
+ * entirely.
  */
 const change = (mutator) => {
-  const run = queue.then(async () => {
+  const slot = slotFor(statePath())
+  const run = slot.queue.then(async () => {
     const state = await readState()
     const next = await mutator(state)
     return next === null ? state : flush(next)
   })
-  queue = run.then(() => undefined, () => undefined)
+  slot.queue = run.then(() => undefined, () => undefined)
   return run
 }
 
@@ -254,6 +327,30 @@ export const setNote = (sessionId, description) =>
   change((state) => {
     const record = { ...(state.byId[sessionId] ?? blankRecord()), description: clip(description, NOTE_MAX_CHARS), updatedAt: Date.now() }
     const byId = { ...state.byId }
+    if (isBlank(record)) delete byId[sessionId]
+    else byId[sessionId] = record
+    return { ...state, byId }
+  })
+
+/**
+ * Persist the title one session is now known to carry, leaving its lineage alone.
+ *
+ * `observe` is the wrong writer for this: it is the listing's "what I just saw"
+ * projection and it REPLACES every field it is given, so a row carrying only a
+ * title would also blank that session's `parentId`, `kind` and `cwd` — renaming a
+ * fork child would silently reclassify it as top-level and drop its parent edge.
+ * This touches the one field it was asked about and nothing else, which is also
+ * why it is a separate export rather than a flag on `observe`.
+ *
+ * @returns the updated state, or null when nothing changed.
+ */
+export const setTitle = (sessionId, title) =>
+  change((state) => {
+    const existing = state.byId[sessionId]
+    const value = asText(title, TITLE_MAX_CHARS)
+    if (existing !== undefined && existing.title === value) return null
+    const byId = { ...state.byId }
+    const record = { ...(existing ?? blankRecord()), title: value, updatedAt: Date.now() }
     if (isBlank(record)) delete byId[sessionId]
     else byId[sessionId] = record
     return { ...state, byId }
@@ -306,12 +403,22 @@ export const addDelegation = (delegation) =>
   })
 
 /**
- * Settle one delegation that is still pending. A record that already settled is
- * left alone (returning null skips the write), so a second watcher pass can
- * never overwrite a recorded outcome.
+ * Settle one delegation that is still pending, returning the settled record.
+ *
+ * This is the **claim**: it is the only place a delegation moves out of
+ * `pending`, and it runs inside the store's serialized write queue, so when
+ * several watchers observe the same pending row in the same tick exactly one of
+ * them gets a non-null record. Callers MUST notify only on a non-null return —
+ * a null means "another pass already claimed (or dismissed) this row", and
+ * notifying anyway is what delivered the same callback many times over. A
+ * record that already settled is likewise left alone and answers null.
+ *
+ * @returns the settled record for the winner, or null when nothing changed.
  */
-export const settleDelegation = (id, patch) =>
-  change((state) => {
+export const settleDelegation = (id, patch) => {
+  let settled = null
+  return change((state) => {
+    settled = null
     const index = state.delegations.findIndex((item) => item.id === id)
     if (index < 0) return null
     if (state.delegations[index].status !== 'pending') return null
@@ -319,8 +426,104 @@ export const settleDelegation = (id, patch) =>
     if (merged === null) return null
     const delegations = state.delegations.slice()
     delegations[index] = merged
+    settled = merged
     return { ...state, delegations }
+  }).then(() => settled)
+}
+
+/**
+ * Atomically claim the right to deliver one settled delegation's callback
+ * notice, returning the claimed record for exactly one caller.
+ *
+ * The claim is a synchronous check-and-add on a process-global in-flight set,
+ * so it is atomic with respect to every watcher pass in the process — the
+ * timer's, a `session_delegations` read's, and a second module instance's. A
+ * loser gets null and MUST NOT send. This is the fix for the duplicate
+ * deliveries: the old code called `notifyDelegator` off a settle result it never
+ * checked, so every concurrent pass that had read the same pending row re-sent
+ * the same notice.
+ *
+ * `noticeAttempts` is incremented durably here, so a notice that keeps failing
+ * is bounded across restarts. The claim is deliberately NOT the durable
+ * delivered marker: `notifiedAt` is written by {@link markDelegationNotified}
+ * only after the delegator's session controller ACCEPTED the notice, so a crash
+ * between claiming and sending retries on the next start instead of dropping the
+ * callback. The notice's request id is derived from the delegation id, so that
+ * retry cannot double-deliver even if the first attempt did reach the target.
+ *
+ * @returns the claimed record for the winner, or null when it may not deliver.
+ */
+export const claimDelegationNotice = (id) => {
+  const inFlight = registry().noticeInFlight
+  if (inFlight.has(id)) return null
+  inFlight.add(id)
+  let claimed = null
+  return change((current) => {
+    claimed = null
+    const index = current.delegations.findIndex((item) => item.id === id)
+    if (index < 0) return null
+    const found = current.delegations[index]
+    if (found.status === 'pending' || found.notifiedAt > 0 || found.noticeAttempts >= DELEGATION_NOTICE_MAX_ATTEMPTS) return null
+    const merged = normalizeDelegation({ ...found, noticeAttempts: found.noticeAttempts + 1 })
+    if (merged === null) return null
+    const delegations = current.delegations.slice()
+    delegations[index] = merged
+    claimed = merged
+    return { ...current, delegations }
+  }).then(() => {
+    if (claimed === null) {
+      inFlight.delete(id)
+      return null
+    }
+    return claimed
+  }, (error) => {
+    inFlight.delete(id)
+    throw error
   })
+}
+
+/**
+ * Mark one delegation's callback notice as delivered, durably. Written only
+ * after `sessionController.prompt` accepted it, so a restart never re-enqueues a
+ * notice that already reached the delegator.
+ *
+ * @returns the updated record, or null when the row is gone.
+ */
+export const markDelegationNotified = (id) => {
+  const inFlight = registry().noticeInFlight
+  let marked = null
+  return change((state) => {
+    marked = null
+    const index = state.delegations.findIndex((item) => item.id === id)
+    if (index < 0) return null
+    const current = state.delegations[index]
+    if (current.notifiedAt > 0) return null
+    const merged = normalizeDelegation({ ...current, notifiedAt: Date.now() })
+    if (merged === null) return null
+    const delegations = state.delegations.slice()
+    delegations[index] = merged
+    marked = merged
+    return { ...state, delegations }
+  }).then((state) => {
+    inFlight.delete(id)
+    return marked === null ? null : marked
+  }, (error) => {
+    inFlight.delete(id)
+    throw error
+  })
+}
+
+/**
+ * Release a claim whose delivery failed, so a later pass may retry it. The
+ * attempt was already counted when the claim was taken, so this cannot loop
+ * forever.
+ *
+ * @returns true when a claim was outstanding and is now free.
+ */
+export const releaseDelegationNotice = (id) => {
+  registry().noticeInFlight.delete(id)
+  return true
+}
 
 /** Append one note to a delegation in any state — used when the callback notice itself could not be delivered. */
 export const noteDelegation = (id, text) =>
@@ -336,12 +539,49 @@ export const noteDelegation = (id, text) =>
     return { ...state, delegations }
   })
 
-/** Forget one delegation record. */
-export const dropDelegation = (id) =>
+/**
+ * Append one line to a delegation's ask log — the record of a question handed to
+ * the delegator and of its decision. Unlike `note`, this survives settling:
+ * `settleDelegation` rewrites `note` with the turn outcome, which is why an ask
+ * cannot be remembered there.
+ *
+ * @returns the updated record, or null when the delegation is absent or the log
+ *   did not change.
+ */
+export const appendAskLog = (id, text) =>
   change((state) => {
+    const index = state.delegations.findIndex((item) => item.id === id)
+    if (index < 0) return null
+    const current = state.delegations[index]
+    const line = typeof text === 'string' ? text.trim() : ''
+    if (line.length === 0) return null
+    const askLog = current.askLog.length > 0 ? `${current.askLog}\n${line}` : line
+    const merged = normalizeDelegation({ ...current, askLog })
+    if (merged === null || merged.askLog === current.askLog) return null
+    const delegations = state.delegations.slice()
+    delegations[index] = merged
+    return { ...state, delegations }
+  })
+
+/** Forget one delegation record. */
+export const dropDelegation = (id) =>  change((state) => {
     const delegations = state.delegations.filter((item) => item.id !== id)
     return delegations.length === state.delegations.length ? null : { ...state, delegations }
   })
 
 /** Every delegation still waiting for its target, oldest first. */
 export const pendingDelegations = (state) => (state !== null && state !== undefined && Array.isArray(state.delegations) ? state.delegations.filter((item) => item.status === 'pending') : [])
+
+/**
+ * Every settled delegation whose callback notice has not been delivered yet,
+ * oldest first. This is the watcher's recovery set: a row whose notice was lost
+ * to a process exit between the settle and the delivery, or whose delivery threw
+ * and was released for retry, shows up here and nowhere else. The attempt cap
+ * keeps a permanently undeliverable notice from being retried forever.
+ */
+export const undeliveredDelegations = (state) =>
+  state !== null && state !== undefined && Array.isArray(state.delegations)
+    ? state.delegations
+        .filter((item) => item.status !== 'pending' && item.notifiedAt === 0 && item.noticeAttempts < DELEGATION_NOTICE_MAX_ATTEMPTS)
+        .sort((left, right) => left.settledAt - right.settledAt)
+    : []
