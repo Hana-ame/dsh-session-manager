@@ -11,7 +11,7 @@
 # no shell (`tool-bash` / `tool-pwsh`), no background-job controls, no skills,
 # no plan mode, no presentation tool, and no delegation/workflow rows. The
 # agent this produces cannot run commands; besides observing and directing
-# OTHER sessions through the tools registered by the `@local/dsh-session-manager`
+# OTHER sessions through the tools registered by the `dsh-session-manager`
 # package (see the `tool-session-control` row), it holds its own filesystem
 # read/write tools (the filesystem rows below), so the persona's "read
 # ~/knowledge-base/INDEX.md first" is something the agent can do itself rather
@@ -58,7 +58,7 @@
 # packages — only `node:*` builtins, which resolve anywhere — and registers six
 # tools; see the file's own header for why.
 - id: tool-session-control
-  name: '../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs'
+  name: '../../profiles/node_modules/dsh-session-manager/lib/tools.mjs'
 
 # `/loop` — human slash command plus a fixed-rate (default 120 s) per-session
 # inspection timer, implemented by the sibling package module `lib/loop.mjs`.
@@ -68,7 +68,7 @@
 # this row must stay OUTSIDE any `isolate` realm (behind one it would resolve a
 # private registry this preset never populates, and `/loop` would do nothing).
 - id: tool-loop
-  name: '../../profiles/node_modules/@local/dsh-session-manager/lib/loop.mjs'
+  name: '../../profiles/node_modules/dsh-session-manager/lib/loop.mjs'
 
 # ── filesystem ──────────────────────────────────────────────────────────────
 

@@ -22,7 +22,7 @@ process.env.DSH_HOME = dshHome
 const toolsUrl = new URL('../lib/tools.mjs', import.meta.url)
 const statePath = join(dshHome, 'session-manager', 'state.json')
 /** The store's process-global registry symbol; clearing it simulates a fresh process. */
-const STORE_SYMBOL = Symbol.for('@local/dsh-session-manager.store.v2')
+const STORE_SYMBOL = Symbol.for('dsh-session-manager.store.v2')
 
 const results = []
 const check = (label, condition, detail) => {

@@ -1,5 +1,5 @@
 /**
- * Session-management tools — layer ② of the `@local/dsh-session-manager` package.
+ * Session-management tools — layer ② of the `dsh-session-manager` package.
  *
  * The package holds both layers: this file (the tools) and `store.mjs` (the
  * durable per-session records).

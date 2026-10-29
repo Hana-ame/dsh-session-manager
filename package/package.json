@@ -1,5 +1,5 @@
 {
-  "name": "@local/dsh-session-manager",
+  "name": "dsh-session-manager",
   "version": "0.3.0",
   "private": true,
   "description": "Session manager: one package holding the durable per-session store (relations + describe notes), the management tools that read and write it, the /loop inspection command, and the host-plane ask bridge that unblocks a delegated worker.",

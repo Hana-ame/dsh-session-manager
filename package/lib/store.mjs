@@ -235,7 +235,7 @@ const seedFromLegacy = async () => {
 // comment describes. Sharing the slot makes the "claim" in `settleDelegation`
 // atomic across every instance in the process, which is what the caller relies
 // on to notify exactly once.
-const REGISTRY = Symbol.for('@local/dsh-session-manager.store.v2')
+const REGISTRY = Symbol.for('dsh-session-manager.store.v2')
 
 /** The process-global store registry, created on first use. */
 const registry = () => {

@@ -32,7 +32,7 @@
 ```
    DSH 进程
    ┌──────────────────────────────────────────────────────────────┐
-   │ preset 行: ../../profiles/…/@local/dsh-session-manager/lib/   │
+   │ preset 行: ../../profiles/…/dsh-session-manager/lib/   │
    │            tools.mjs                                          │
    │  lib/tools.mjs ②（每个会话挂载一次）                          │
    │      ├─ observe()/setNote()/addDelegation() ──► ①             │
@@ -143,7 +143,7 @@
 ### D1 一个包，两个安置点（被迫，不是选择）
 
 ```
-$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/   ← 包本体（唯一拷贝）
+$DSH_HOME/profiles/node_modules/dsh-session-manager/   ← 包本体（唯一拷贝）
 $DSH_HOME/.agent-presets/session-manager/                     ← preset，行指回上面
 ```
 
@@ -153,7 +153,7 @@ preset 行的解析规则（`@deepseek-ai/dsh-agent-presets`）决定了工具�
 - **裸包名 → 只从 harness 安装目录解析**（不是从 profile 的 `node_modules`）；
 - 绝对路径 → `file:` URL。
 
-所以 `../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs` 是唯一既能指到已安装的包、又不必把工具再复制一份的写法。**代价**：preset 不再自足——只拷 `preset/` 而不装包，组合会挂载失败。`install.sh` 因此把两者当一件事装。
+所以 `../../profiles/node_modules/dsh-session-manager/lib/tools.mjs` 是唯一既能指到已安装的包、又不必把工具再复制一份的写法。**代价**：preset 不再自足——只拷 `preset/` 而不装包，组合会挂载失败。`install.sh` 因此把两者当一件事装。
 
 （已验证：`ctx.agentPresets.standingKeyFor('session-manager')` 真实组合通过。）
 

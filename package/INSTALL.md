@@ -7,7 +7,7 @@
 That writes two destinations that both read **one** package copy:
 
 ```
-$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/   # the package (all layers)
+$DSH_HOME/profiles/node_modules/dsh-session-manager/   # the package (all layers)
 $DSH_HOME/.agent-presets/session-manager/                     # the preset that mounts ②
 ```
 
@@ -71,7 +71,7 @@ one row covers every profile):
 ```yaml
 - insert:
     - id: session-manager-ask-bridge
-      name: './profiles/node_modules/@local/dsh-session-manager/lib/ask-bridge.mjs'
+      name: './profiles/node_modules/dsh-session-manager/lib/ask-bridge.mjs'
       config:
         timeoutMs: 0          # 0 = wait for the delegator forever; the default
 ```
@@ -97,7 +97,7 @@ around by moving files:
 - **The preset mounts the tools by a relative path into the package.**
   `@deepseek-ai/dsh-agent-presets` resolves a row whose specifier starts with
   `.` against that composition's own directory, and a bare package name against
-  the **harness install**. `../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs`
+  the **harness install**. `../../profiles/node_modules/dsh-session-manager/lib/tools.mjs`
   is therefore the one specifier form that reaches an installed package without
   copying the tools next to the preset. Verified by composing the preset for
   real (`ctx.agentPresets.standingKeyFor('session-manager')`).
@@ -124,7 +124,7 @@ around by moving files:
   cache until the row is re-created.
 - Changing `package.json` or a preset composition needs a restart.
 - The relative specifiers count on the package living at
-  `profiles/node_modules/@local/dsh-session-manager/`. Move it and both rows stop
+  `profiles/node_modules/dsh-session-manager/`. Move it and both rows stop
   resolving.
 
 ## Verifying an install
@@ -143,11 +143,11 @@ are upgrading an existing install, three leftovers have to go by hand; the
 installer only reports them, because `cordis.patch.yml` is your file.
 
 1. The Loader row that existed only to get the client half served:
-   delete the `- insert:` block naming `@local/dsh-session-manager` (id
+   delete the `- insert:` block naming `dsh-session-manager` (id
    `session-manager`) from `$DSH_HOME/profiles/web/cordis.patch.yml`. A row
    pointing at a package with no entry module is a boot error, not a no-op.
 2. `lib/client.js` and `lib/index.js` under
-   `$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/` — `install.sh`
+   `$DSH_HOME/profiles/node_modules/dsh-session-manager/` — `install.sh`
    removes these for you on the next run.
 3. If you also have the even older `$DSH_HOME/agent-canvas/` directory, nothing
    loads it; delete it as well.

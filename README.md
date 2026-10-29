@@ -18,7 +18,7 @@
 ## 目录结构
 
 ```
-package/                             # @local/dsh-session-manager：唯一的包，各层都在里面
+package/                             # dsh-session-manager：唯一的包，各层都在里面
 ├── package.json                     # exports: "./tools" | "./store"
 ├── lib/
 │   ├── store.mjs                    # ① 持久化存储（原子写 + stat 校验缓存）
@@ -49,8 +49,8 @@ install.sh                           # 一次装好：package + preset（④ 的
 
 它写两个位置，但只有**一份** package 拷贝：
 
-- `$DSH_HOME/profiles/node_modules/@local/dsh-session-manager/` —— 包本体（各层都在这里）；
-- `$DSH_HOME/.agent-presets/session-manager/` —— preset，它的工具行用相对路径 `../../profiles/node_modules/@local/dsh-session-manager/lib/tools.mjs` 指回上面那份包。
+- `$DSH_HOME/profiles/node_modules/dsh-session-manager/` —— 包本体（各层都在这里）；
+- `$DSH_HOME/.agent-presets/session-manager/` —— preset，它的工具行用相对路径 `../../profiles/node_modules/dsh-session-manager/lib/tools.mjs` 指回上面那份包。
 
 这两个位置都是被机制逼出来的，不是选择（详见 `package/INSTALL.md`）：preset 行的**裸包名只从 harness 安装目录解析**，相对路径才够得着已安装的包。包不再声明 `dsh.client`，所以**不需要** profile 行，也不提供任何 HTTP 路由。
 
